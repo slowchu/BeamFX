@@ -13,8 +13,7 @@ saved gameplay. If BeamFX is missing or temporarily unavailable, a well-made
 producer should lose only its beam visuals.
 
 > **Alpha status:** this is package `0.1.0-alpha.1`, public API `1.0`.
-> Until a software license is selected, this package is for local development
-> and testing only. Do not upload, redistribute, or bundle it with another mod.
+> BeamFX is open-source software released under the MIT License.
 
 ## Start here
 
@@ -206,3 +205,9 @@ BeamFX.
 - [API reference](docs/API.md) — exact contracts and schemas.
 - [Architecture](docs/ARCHITECTURE.md) — ownership and data flow.
 - [Changelog](CHANGELOG.md) — public package history.
+
+## License
+
+BeamFX is released under the [MIT License](LICENSE).
+
+Copyright (c) 2026 slowchu.
