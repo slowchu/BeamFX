@@ -1,0 +1,447 @@
+uniform_int bfxSegmentCount {
+    default = 0;
+    min = 0;
+    max = 64;
+    static = false;
+}
+
+uniform_vec4 bfxSegmentStartRadius {
+    size = 64;
+    static = false;
+}
+
+uniform_vec4 bfxSegmentEndMetadata {
+    size = 64;
+    static = false;
+}
+
+uniform_vec4 bfxPaletteOuterCore {
+    size = 16;
+    static = false;
+}
+
+uniform_vec4 bfxPaletteCoreGeometry {
+    size = 16;
+    static = false;
+}
+
+fragment main {
+    omw_In vec2 omw_TexCoord;
+
+    float wfRaySegmentDistance(
+        vec3 rayDirection,
+        vec3 segmentStart,
+        vec3 segmentEnd,
+        out float rayDistance
+    ) {
+        vec3 segmentVector = segmentEnd - segmentStart;
+        float segmentLengthSquared = dot(segmentVector, segmentVector);
+        if (segmentLengthSquared <= 0.000001) {
+            rayDistance = max(0.0, dot(segmentStart, rayDirection));
+            return length(rayDirection * rayDistance - segmentStart);
+        }
+
+        float raySegmentDot = dot(rayDirection, segmentVector);
+        float startRayDot = dot(segmentStart, rayDirection);
+        float startSegmentDot = dot(segmentStart, segmentVector);
+        float denominator = segmentLengthSquared - raySegmentDot * raySegmentDot;
+        float segmentFraction;
+        if (denominator > 0.000001) {
+            segmentFraction = (startRayDot * raySegmentDot - startSegmentDot) / denominator;
+        } else {
+            segmentFraction = -startSegmentDot / segmentLengthSquared;
+        }
+        segmentFraction = clamp(segmentFraction, 0.0, 1.0);
+
+        vec3 segmentPoint = segmentStart + segmentVector * segmentFraction;
+        rayDistance = dot(segmentPoint, rayDirection);
+        if (rayDistance < 0.0) {
+            rayDistance = 0.0;
+            segmentFraction = clamp(-startSegmentDot / segmentLengthSquared, 0.0, 1.0);
+            segmentPoint = segmentStart + segmentVector * segmentFraction;
+        }
+        return length(rayDirection * rayDistance - segmentPoint);
+    }
+
+    float wfSignedHash(float value) {
+        return fract(sin(value) * 43758.5453123) * 2.0 - 1.0;
+    }
+
+    float wfUnitHash(float value) {
+        return 0.5 + 0.5 * wfSignedHash(value);
+    }
+
+    float wfPlasmaParticleDistance(
+        vec3 rayDirection,
+        vec3 segmentStart,
+        vec3 segmentEnd,
+        float fieldRadius,
+        float spacingHint,
+        float seed,
+        out float rayDistance,
+        out float particleRadius,
+        out float particleKey,
+        out float particleBrightness
+    ) {
+        vec3 segmentVector = segmentEnd - segmentStart;
+        float segmentLength = length(segmentVector);
+        if (segmentLength <= 0.0001) {
+            rayDistance = max(0.0, dot(segmentStart, rayDirection));
+            particleRadius = max(0.9, fieldRadius * 0.18);
+            particleKey = seed;
+            particleBrightness = 1.0;
+            return length(rayDirection * rayDistance - segmentStart);
+        }
+
+        vec3 forward = segmentVector / segmentLength;
+        vec3 referenceAxis = abs(forward.z) < 0.90
+            ? vec3(0.0, 0.0, 1.0)
+            : vec3(0.0, 1.0, 0.0);
+        vec3 right = normalize(cross(forward, referenceAxis));
+        vec3 up = normalize(cross(right, forward));
+        float lineRayDistance = 0.0;
+        wfRaySegmentDistance(
+            rayDirection,
+            segmentStart,
+            segmentEnd,
+            lineRayDistance
+        );
+        float spacing = max(6.0, spacingHint);
+        float along = clamp(
+            dot(rayDirection * lineRayDistance - segmentStart, forward),
+            0.0,
+            segmentLength
+        );
+        // OpenMW 0.51 advances the post-process simulation clock in seconds.
+        float flowTravel = omw.simulationTime * 90.0
+            + seed * spacing * 0.37;
+        float flowCell = floor(flowTravel / spacing);
+        float flowOffset = flowTravel - flowCell * spacing;
+        float nearestCell = floor((along - flowOffset) / spacing + 0.5);
+        float maximumCell = ceil(segmentLength / spacing) + 1.0;
+        float bestNormalizedDistance = 1.0e20;
+        float bestDistance = 1.0e20;
+        float bestRayDistance = 0.0;
+        float bestRadius = max(0.9, fieldRadius * 0.18);
+        float bestKey = seed;
+        float bestBrightness = 1.0;
+        float emitterClearance = max(
+            spacing * 1.10,
+            min(fieldRadius * 1.50, 32.0)
+        );
+
+        // Two deterministic specks in each nearby longitudinal cell imply a
+        // dense particle field without creating particle objects or iterating
+        // over every visible mote.
+        for (int cellOffset = -1; cellOffset <= 1; ++cellOffset) {
+            float cell = nearestCell + float(cellOffset);
+            if (cell < -1.0 || cell > maximumCell) {
+                continue;
+            }
+            for (int layer = 0; layer < 2; ++layer) {
+                // Keeping identity tied to the completed flow cell makes each
+                // mote cross a spacing boundary without changing shape.
+                float identityCell = cell - flowCell;
+                float key = seed * 41.17
+                    + identityCell * 17.83
+                    + float(layer) * 73.31;
+                if (layer == 1 && wfUnitHash(key + 9.71) < 0.52) {
+                    continue;
+                }
+
+                float centerAlong = cell * spacing + flowOffset;
+                if (identityCell != 0.0) {
+                    centerAlong += wfSignedHash(key + 21.43) * spacing * 0.26;
+                }
+                // Leave the physical projectile model unobstructed at the
+                // emitter. View-dependent particle selection in this region
+                // otherwise reads as core flicker while the camera moves.
+                if (centerAlong < emitterClearance) {
+                    continue;
+                }
+                if (centerAlong < 0.0 || centerAlong > segmentLength) {
+                    continue;
+                }
+
+                vec2 lateral = vec2(
+                    wfSignedHash(key + 37.19),
+                    wfSignedHash(key + 61.07)
+                );
+                float lateralLength = length(lateral);
+                if (lateralLength > 1.0) {
+                    lateral /= lateralLength;
+                }
+                float motionPhase = omw.simulationTime * 9.0
+                    + key * 0.31;
+                lateral += vec2(
+                    sin(motionPhase),
+                    sin(motionPhase * 0.73 + 1.91)
+                ) * 0.16;
+                float lateralLimit = fieldRadius * (layer == 0 ? 0.58 : 0.92);
+                vec3 center = segmentStart
+                    + forward * centerAlong
+                    + right * lateral.x * lateralLimit
+                    + up * lateral.y * lateralLimit;
+
+                float sizeMinimum = layer == 0 ? 0.13 : 0.10;
+                float sizeMaximum = layer == 0 ? 0.24 : 0.19;
+                float candidateRadius = max(
+                    0.9,
+                    fieldRadius * mix(
+                        sizeMinimum,
+                        sizeMaximum,
+                        wfUnitHash(key + 87.53)
+                    )
+                );
+                float candidateRayDistance = max(0.0, dot(center, rayDirection));
+                float candidateDistance = length(
+                    rayDirection * candidateRayDistance - center
+                );
+                float normalizedDistance = candidateDistance / candidateRadius;
+                if (normalizedDistance < bestNormalizedDistance) {
+                    bestNormalizedDistance = normalizedDistance;
+                    bestDistance = candidateDistance;
+                    bestRayDistance = candidateRayDistance;
+                    bestRadius = candidateRadius;
+                    bestKey = key;
+                    bestBrightness = mix(
+                        0.78,
+                        1.28,
+                        wfUnitHash(key + 113.29)
+                    );
+                }
+            }
+        }
+
+        rayDistance = bestRayDistance;
+        particleRadius = bestRadius;
+        particleKey = bestKey;
+        particleBrightness = bestBrightness;
+        return bestDistance;
+    }
+
+    float wfElectricDistance(
+        vec3 rayDirection,
+        vec3 segmentStart,
+        vec3 segmentEnd,
+        float displacement,
+        float seed,
+        out float rayDistance
+    ) {
+        vec3 segmentVector = segmentEnd - segmentStart;
+        float segmentLengthSquared = dot(segmentVector, segmentVector);
+        if (segmentLengthSquared <= 0.000001 || displacement <= 0.0001) {
+            return wfRaySegmentDistance(
+                rayDirection,
+                segmentStart,
+                segmentEnd,
+                rayDistance
+            );
+        }
+
+        vec3 forward = segmentVector * inversesqrt(segmentLengthSquared);
+        vec3 referenceAxis = abs(forward.z) < 0.90
+            ? vec3(0.0, 0.0, 1.0)
+            : vec3(0.0, 1.0, 0.0);
+        vec3 right = normalize(cross(forward, referenceAxis));
+        vec3 up = normalize(cross(right, forward));
+        float animationFrame = floor(omw.simulationTime * 12.0);
+        vec3 previousPoint = segmentStart;
+        float bestDistance = 1.0e20;
+        float bestRayDistance = 0.0;
+
+        for (int leg = 1; leg <= 6; ++leg) {
+            float progress = float(leg) / 6.0;
+            vec3 point = segmentStart + segmentVector * progress;
+            if (leg < 6) {
+                float envelope = sin(3.14159265 * progress);
+                float noiseKey = seed * 17.17
+                    + float(leg) * 23.71
+                    + animationFrame * 11.13;
+                float horizontal = wfSignedHash(noiseKey);
+                float vertical = wfSignedHash(noiseKey + 47.93);
+                point += (
+                    right * horizontal
+                    + up * vertical * 0.65
+                ) * displacement * envelope;
+            }
+
+            float legRayDistance = 0.0;
+            float legDistance = wfRaySegmentDistance(
+                rayDirection,
+                previousPoint,
+                point,
+                legRayDistance
+            );
+            if (legDistance < bestDistance) {
+                bestDistance = legDistance;
+                bestRayDistance = legRayDistance;
+            }
+            previousPoint = point;
+        }
+
+        rayDistance = bestRayDistance;
+        return bestDistance;
+    }
+
+    void main() {
+        vec4 sceneColor = omw_GetLastShader(omw_TexCoord);
+        vec3 sceneRelative = omw_GetWorldPosFromUV(omw_TexCoord) - omw.eyePos.xyz;
+        float sceneDistance = length(sceneRelative);
+        if (sceneDistance <= 0.0001 || bfxSegmentCount <= 0) {
+            omw_FragColor = sceneColor;
+            return;
+        }
+
+        vec3 rayDirection = sceneRelative / sceneDistance;
+        vec3 beamLight = vec3(0.0);
+
+        for (int index = 0; index < 64; ++index) {
+            if (index >= bfxSegmentCount) {
+                break;
+            }
+
+            vec4 startWidth = bfxSegmentStartRadius[index];
+            vec4 endMetadata = bfxSegmentEndMetadata[index];
+            // Bits: palette 4, style 2, opacity 8, intensity 6, seed 4.
+            uint metadata = uint(max(0.0, endMetadata.w) + 0.5);
+            int paletteIndex = int(metadata & 15u);
+            int styleId = int((metadata >> 4u) & 3u);
+            float opacity = float((metadata >> 6u) & 255u) / 255.0;
+            float intensity = float((metadata >> 14u) & 63u) * (8.0 / 63.0);
+            float seed = float((metadata >> 20u) & 15u);
+            vec4 outerCore = bfxPaletteOuterCore[paletteIndex];
+            vec4 coreGeometry = bfxPaletteCoreGeometry[paletteIndex];
+
+            float radius = max(0.001, startWidth.w);
+            float rayDistance = 0.0;
+            float plasmaKey = seed;
+            float plasmaBrightness = 1.0;
+            bool plasmaEmitterCore = false;
+            float distanceToBeam = wfRaySegmentDistance(
+                rayDirection,
+                startWidth.xyz,
+                endMetadata.xyz,
+                rayDistance
+            );
+
+            if (styleId == 1) {
+                float displacement = max(0.0, coreGeometry.w);
+                // Most pixels stop at the straight broad path; only nearby
+                // fragments pay for the procedural six-leg lightning shape.
+                if (distanceToBeam >= radius + displacement * 1.25) {
+                    continue;
+                }
+                distanceToBeam = wfElectricDistance(
+                    rayDirection,
+                    startWidth.xyz,
+                    endMetadata.xyz,
+                    displacement,
+                    seed,
+                    rayDistance
+                );
+            } else if (styleId == 2) {
+                if (distanceToBeam >= radius * 1.45) {
+                    continue;
+                }
+                float particleRadius = radius;
+                distanceToBeam = wfPlasmaParticleDistance(
+                    rayDirection,
+                    startWidth.xyz,
+                    endMetadata.xyz,
+                    radius,
+                    coreGeometry.w,
+                    seed,
+                    rayDistance,
+                    particleRadius,
+                    plasmaKey,
+                    plasmaBrightness
+                );
+                radius = particleRadius;
+                // Seed zero is reserved for one stable glow at the shared
+                // carrier origin; cross arms must not stack duplicate cores.
+                if (seed < 0.5) {
+                    float emitterRadius = max(12.0, min(startWidth.w * 0.90, 20.0));
+                    float emitterRayDistance = max(0.0, dot(startWidth.xyz, rayDirection));
+                    float emitterDistance = length(
+                        rayDirection * emitterRayDistance - startWidth.xyz
+                    );
+                    if (emitterDistance / emitterRadius < distanceToBeam / radius) {
+                        distanceToBeam = emitterDistance;
+                        rayDistance = emitterRayDistance;
+                        radius = emitterRadius;
+                        plasmaBrightness = 1.0;
+                        plasmaEmitterCore = true;
+                    }
+                }
+            }
+
+            if (distanceToBeam >= radius || rayDistance <= omw.near * 0.25) {
+                continue;
+            }
+
+            float shellDepth = rayDistance - sqrt(max(0.0, radius * radius - distanceToBeam * distanceToBeam));
+            float depthTolerance = plasmaEmitterCore ? 3.0 : 1.0;
+            if (shellDepth > sceneDistance + depthTolerance) {
+                continue;
+            }
+
+            float normalizedDistance = distanceToBeam / radius;
+            float edgeFade = 1.0 - smoothstep(0.72, 1.0, normalizedDistance);
+            float haloFalloff = styleId == 2
+                ? 1.95
+                : (styleId == 3 ? 2.45 : 3.25);
+            float halo = exp(-haloFalloff * normalizedDistance * normalizedDistance) * edgeFade;
+            float coreRatio = clamp(outerCore.w, 0.02, 1.0);
+            if (styleId == 3) {
+                coreRatio *= 0.72;
+            } else if (styleId == 2) {
+                coreRatio *= 0.55;
+            }
+            float coreRadius = radius * coreRatio;
+            float antialiasWidth = max(fwidth(distanceToBeam), 0.35);
+            float core = 1.0 - smoothstep(
+                max(0.0, coreRadius - antialiasWidth),
+                coreRadius + antialiasWidth,
+                distanceToBeam
+            );
+            float flicker = 0.94 + 0.06 * sin(
+                omw.simulationTime * 21.0
+                + seed * 1.37
+                + dot(startWidth.xyz + endMetadata.xyz, vec3(0.013, 0.017, 0.019))
+            );
+            if (styleId == 1) {
+                flicker = 0.82 + 0.18 * sin(
+                    omw.simulationTime * 37.0
+                    + seed * 2.11
+                );
+            } else if (styleId == 2) {
+                flicker = plasmaEmitterCore
+                    ? 0.95 + 0.05 * sin(omw.simulationTime * 4.0 + seed * 0.53)
+                    : plasmaBrightness;
+            }
+            intensity = max(0.0, intensity) * flicker;
+            opacity = clamp(opacity, 0.0, 1.0);
+            if (plasmaEmitterCore) {
+                // The NIF supplies the solid center. This larger shader sphere
+                // contributes only a soft pulse around it, avoiding depth
+                // competition with the carrier as the viewpoint changes.
+                beamLight += outerCore.rgb * halo * opacity * intensity * 0.78;
+            } else {
+                beamLight += outerCore.rgb * halo * opacity * intensity;
+                beamLight += coreGeometry.rgb * core * opacity * intensity;
+            }
+        }
+
+        omw_FragColor = vec4(sceneColor.rgb + beamLight, sceneColor.a);
+    }
+}
+
+technique {
+    passes = main;
+    glsl_version = 330;
+    dynamic = true;
+    description = "BeamFX compact depth-aware beam renderer";
+    author = "BeamFX";
+    version = "1";
+}
