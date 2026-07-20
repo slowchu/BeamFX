@@ -1,0 +1,3 @@
+# Rename this file and the script path before shipping your mod.
+GLOBAL: scripts/example_beam_consumer/global.lua
+PLAYER: scripts/example_beam_consumer/player.lua

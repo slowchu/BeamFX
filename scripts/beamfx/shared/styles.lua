@@ -12,6 +12,7 @@ local STYLE_IDS = {
     electric = 1,
     plasma = 2,
     trail = 3,
+    filament = 4,
 }
 
 local STYLE_NAMES = {
@@ -19,6 +20,7 @@ local STYLE_NAMES = {
     [1] = "electric",
     [2] = "plasma",
     [3] = "trail",
+    [4] = "filament",
 }
 
 local STYLE_ALIASES = {
@@ -79,7 +81,7 @@ function styles.name(style_id)
 end
 
 function styles.names()
-    return { "smooth", "electric", "plasma", "trail" }
+    return { "smooth", "electric", "plasma", "trail", "filament" }
 end
 
 function styles.aliases()

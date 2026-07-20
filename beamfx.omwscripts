@@ -1,3 +1,3 @@
-# BeamFX standalone provider and parity-proven renderer
+# BeamFX standalone provider and shared renderer
 GLOBAL: scripts/beamfx/global/init.lua
 PLAYER: scripts/beamfx/player/init.lua

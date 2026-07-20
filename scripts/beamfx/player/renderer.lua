@@ -15,11 +15,26 @@ local scheduler = require("scripts.beamfx.player.scheduler")
 
 local beam_renderer = {}
 
-local SHADER_NAME = "beamfx_core"
+local SHADER_NAME = constants.SHADER_RESOURCE
 local MAX_SHADER_SEGMENTS = beam_styles.SEGMENT_CAPACITY
 local MAX_SHADER_PALETTES = beam_styles.PALETTE_CAPACITY
 local SHADER_RETRY_SECONDS = 5
 local VIEWPORT_MARGIN = 0.20
+local UINT8_MAX = 255
+local UINT10_MAX = 1023
+local UINT12_MAX = 4095
+local UINT16_MAX = 65535
+local FEATURE_DISTANCE_MIN = 0.01
+local FEATURE_DISTANCE_MAX = 1000000
+local FEATURE_DISTANCE_LOG_MIN = math.log(FEATURE_DISTANCE_MIN) / math.log(2)
+local FEATURE_DISTANCE_LOG_SPAN =
+    math.log(FEATURE_DISTANCE_MAX / FEATURE_DISTANCE_MIN) / math.log(2)
+local LONGITUDINAL_MODE_ID = {
+    solid = 0,
+    travel = 1,
+    pulse = 2,
+    dash = 3,
+}
 local ZERO_VECTOR4 = util.vector4(0, 0, 0, 0)
 
 local ok_postprocessing, postprocessing = pcall(require, "openmw.postprocessing")
@@ -61,8 +76,11 @@ local state = {
     uniforms = {
         starts = {},
         ends = {},
+        featureState = {},
         paletteOuter = {},
         paletteCore = {},
+        paletteBaseShape = {},
+        paletteLongitudinal = {},
     },
 }
 
@@ -71,8 +89,11 @@ for index = 1, MAX_SHADER_SEGMENTS do
     state.uniforms.ends[index] = ZERO_VECTOR4
 end
 for index = 1, MAX_SHADER_PALETTES do
+    state.uniforms.featureState[index] = ZERO_VECTOR4
     state.uniforms.paletteOuter[index] = ZERO_VECTOR4
     state.uniforms.paletteCore[index] = ZERO_VECTOR4
+    state.uniforms.paletteBaseShape[index] = ZERO_VECTOR4
+    state.uniforms.paletteLongitudinal[index] = ZERO_VECTOR4
 end
 
 local function now()
@@ -111,6 +132,43 @@ local function clamp(value, minimum, maximum)
     return math.max(minimum, math.min(maximum, tonumber(value) or minimum))
 end
 
+local function quantizeUnit(value, maximum)
+    return math.floor(clamp(value, 0, 1) * maximum + 0.5)
+end
+
+local function positiveModulo(value, modulus)
+    if modulus <= 0 then
+        return 0
+    end
+    local result = value % modulus
+    if result < 0 then
+        result = result + modulus
+    end
+    return result
+end
+
+local function encodeFeatureDistance(value)
+    value = tonumber(value) or 0
+    if value <= 0 then
+        return 0
+    end
+    local exponent = math.log(clamp(
+        value,
+        FEATURE_DISTANCE_MIN,
+        FEATURE_DISTANCE_MAX
+    )) / math.log(2)
+    local normalized = (exponent - FEATURE_DISTANCE_LOG_MIN)
+        / FEATURE_DISTANCE_LOG_SPAN
+    return 1 + math.floor(clamp(normalized, 0, 1) * (UINT10_MAX - 1) + 0.5)
+end
+
+local function packRgb888(color)
+    local red = quantizeUnit(color and color[1] or 0, UINT8_MAX)
+    local green = quantizeUnit(color and color[2] or 0, UINT8_MAX)
+    local blue = quantizeUnit(color and color[3] or 0, UINT8_MAX)
+    return red + green * 256 + blue * 65536
+end
+
 local function finiteNumber(value)
     return type(value) == "number"
         and value == value
@@ -145,7 +203,14 @@ local function copyProtocolSegment(segment, beam, index)
         id = tostring(index),
         startPos = start_pos,
         endPos = end_pos,
-        width = segment.radius,
+        width = segment.startRadius,
+        startRadius = segment.startRadius,
+        endRadius = segment.endRadius,
+        minPixelWidth = segment.minPixelWidth,
+        startFadeLength = segment.startFadeLength,
+        endFadeLength = segment.endFadeLength,
+        depthSoftness = segment.depthSoftness,
+        fogInfluence = segment.fogInfluence,
         coreRatio = segment.coreRatio,
         color = {
             segment.outerColor[1],
@@ -157,11 +222,19 @@ local function copyProtocolSegment(segment, beam, index)
             segment.coreColor[2],
             segment.coreColor[3],
         },
+        baseColor = {
+            segment.baseColor[1],
+            segment.baseColor[2],
+            segment.baseColor[3],
+        },
+        baseOpacity = segment.baseOpacity,
         intensity = segment.intensity,
         opacity = segment.opacity,
         style = segment.style,
         styleScale = segment.styleScale,
         seed = segment.seed,
+        longitudinal = segment.longitudinal,
+        animationStartedAt = beam.animationStartedAt,
         createdAt = segment.createdAt or beam.createdAt,
         fadeStartAt = segment.fadeStartAt,
         expiresAt = segment.expiresAt,
@@ -298,9 +371,8 @@ local function timelineOpacity(fade_start_at, expires_at, current_time)
     return 1
 end
 
-local function segmentOpacity(segment, beam, current_time)
+local function segmentLifecycle(segment, beam, current_time)
     local expires_at = tonumber(segment.expiresAt)
-    local opacity = clamp(segment.opacity or 1, 0, 1)
     local fade_start_at = tonumber(segment.fadeStartAt)
     local segment_factor = timelineOpacity(
         fade_start_at,
@@ -319,7 +391,7 @@ local function segmentOpacity(segment, beam, current_time)
             current_time
         )
     end
-    return opacity * segment_factor * beam_factor
+    return segment_factor * beam_factor
 end
 
 local function viewportProjection(position)
@@ -439,16 +511,20 @@ local function collectSegments(camera_pos, current_time, current_space_key)
                     table.remove(segments, index)
                 else
                     active_count = active_count + 1
-                    local opacity = segmentOpacity(
+                    local lifecycle = segmentLifecycle(
                         segment,
                         beam,
                         current_time
                     )
-                    if opacity > 0 then
+                    local opacity = clamp(segment.opacity or 1, 0, 1)
+                        * lifecycle
+                    local base_opacity = clamp(segment.baseOpacity or 0, 0, 1)
+                    if lifecycle > 0 and (opacity > 0 or base_opacity > 0) then
                         local viewport_priority = segmentViewportPriority(segment)
                         packed[#packed + 1] = {
                             segment = segment,
                             opacity = opacity,
+                            lifecycle = lifecycle,
                             viewportPriority = viewport_priority,
                             distanceSquared = distanceSquaredToSegment(
                                 camera_pos,
@@ -511,18 +587,149 @@ local function quantized(value, scale)
     return math.floor((tonumber(value) or 0) * scale + 0.5)
 end
 
+local function segmentLength(segment)
+    local direction = segment.endPos - segment.startPos
+    return math.sqrt(math.max(0, direction:dot(direction)))
+end
+
+local function longitudinalProfile(segment)
+    local longitudinal = segment.longitudinal or {
+        mode = "solid",
+        pathOffset = 0,
+    }
+    local mode = longitudinal.mode or "solid"
+    local mode_id = LONGITUDINAL_MODE_ID[mode] or 0
+    local taper = segment.endRadius ~= segment.startRadius
+    local reverse_travel = mode == "travel"
+        and (tonumber(longitudinal.speed) or 0) < 0
+    local shape = encodeFeatureDistance(segment.startFadeLength)
+        + encodeFeatureDistance(segment.endFadeLength) * 1024
+        + mode_id * 1048576
+        + (taper and 4194304 or 0)
+        + (reverse_travel and 8388608 or 0)
+    local end_radius = taper and segment.endRadius or 0
+    local primary = 0
+    local secondary = 0
+
+    if mode == "travel" then
+        -- Travel phase uses the high bit as an off-path discriminator:
+        -- 0 is before the segment, 1..32767 is an active local head, and
+        -- 32768..65535 is after the segment or in loop delay. The ignored
+        -- low payload in the latter range still advances diagnostically.
+        local visible_length = math.max(
+            FEATURE_DISTANCE_MIN,
+            tonumber(longitudinal.visibleLength) or FEATURE_DISTANCE_MIN
+        )
+        primary = visible_length
+        local head_ratio = clamp(
+            (tonumber(longitudinal.headFadeLength) or 0) / visible_length,
+            0,
+            1
+        )
+        local tail_ratio = clamp(
+            (tonumber(longitudinal.tailFadeLength) or 0) / visible_length,
+            0,
+            1
+        )
+        secondary = quantizeUnit(head_ratio, UINT12_MAX)
+            + quantizeUnit(tail_ratio, UINT12_MAX) * 4096
+    elseif mode == "pulse" then
+        local period = math.max(
+            FEATURE_DISTANCE_MIN,
+            tonumber(longitudinal.period) or FEATURE_DISTANCE_MIN
+        )
+        local pulse_length = clamp(
+            longitudinal.pulseLength,
+            FEATURE_DISTANCE_MIN,
+            period
+        )
+        local fade_ratio = clamp(
+            (tonumber(longitudinal.fadeLength) or 0)
+                / math.max(pulse_length, FEATURE_DISTANCE_MIN),
+            0,
+            0.5
+        )
+        primary = period
+        secondary = quantizeUnit(pulse_length / period, UINT10_MAX)
+            + quantizeUnit(fade_ratio * 2, 127) * 1024
+            + quantizeUnit(longitudinal.carrierLevel or 0, 127) * 131072
+    elseif mode == "dash" then
+        local dash_length = math.max(
+            FEATURE_DISTANCE_MIN,
+            tonumber(longitudinal.dashLength) or FEATURE_DISTANCE_MIN
+        )
+        local cycle_length = dash_length
+            + math.max(0, tonumber(longitudinal.gapLength) or 0)
+        local fade_ratio = clamp(
+            (tonumber(longitudinal.fadeLength) or 0) / dash_length,
+            0,
+            0.5
+        )
+        primary = cycle_length
+        secondary = quantizeUnit(dash_length / cycle_length, UINT12_MAX)
+            + quantizeUnit(fade_ratio * 2, UINT12_MAX) * 4096
+    end
+
+    return {
+        mode = mode,
+        modeId = mode_id,
+        taper = taper,
+        reverseTravel = reverse_travel,
+        shape = shape,
+        endRadius = end_radius,
+        primary = primary,
+        secondary = secondary,
+    }
+end
+
 local function paletteEntry(segment)
     if segment.paletteEntry ~= nil then
         return segment.paletteEntry
     end
+    local longitudinal = longitudinalProfile(segment)
+    local base_opacity = clamp(segment.baseOpacity or 0, 0, 1)
+    local fog_influence = clamp(segment.fogInfluence or 0, 0, 1)
+    local base_opacity_byte = base_opacity > 0
+        and math.max(1, quantizeUnit(base_opacity, UINT8_MAX))
+        or 0
+    local fog_influence_byte = fog_influence > 0
+        and math.max(1, quantizeUnit(fog_influence, UINT8_MAX))
+        or 0
+    local base_shape = {
+        packRgb888(segment.baseColor),
+        base_opacity_byte + fog_influence_byte * 256,
+        math.max(0, tonumber(segment.minPixelWidth) or 0),
+        math.max(0, tonumber(segment.depthSoftness) or 0),
+    }
     local entry = {
         color = segment.color,
         coreColor = segment.coreColor,
         coreRatio = segment.coreRatio,
         styleScale = segment.styleScale,
+        baseColor = segment.baseColor,
+        baseOpacity = base_opacity,
+        fogInfluence = fog_influence,
+        minPixelWidth = segment.minPixelWidth,
+        depthSoftness = segment.depthSoftness,
+        startFadeLength = segment.startFadeLength,
+        endFadeLength = segment.endFadeLength,
+        endRadius = segment.endRadius,
+        baseShape = base_shape,
+        longitudinal = longitudinal,
     }
+    entry.classKey = table.concat({
+        longitudinal.mode,
+        base_opacity > 0 and "base" or "nobase",
+        fog_influence > 0 and "fog" or "nofog",
+        entry.minPixelWidth > 0 and "pixel" or "nopixel",
+        entry.depthSoftness > 0 and "soft" or "hard",
+        entry.startFadeLength > 0 and "startfade" or "nostartfade",
+        entry.endFadeLength > 0 and "endfade" or "noendfade",
+        longitudinal.taper and "taper" or "notaper",
+        longitudinal.reverseTravel and "reverse" or "forward",
+    }, ":")
     entry.key = string.format(
-        "%d:%d:%d:%d:%d:%d:%d:%d",
+        "%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d",
         quantized(entry.color[1], 1024),
         quantized(entry.color[2], 1024),
         quantized(entry.color[3], 1024),
@@ -530,8 +737,16 @@ local function paletteEntry(segment)
         quantized(entry.coreColor[2], 1024),
         quantized(entry.coreColor[3], 1024),
         quantized(entry.coreRatio, 1024),
-        quantized(entry.styleScale, 16)
+        quantized(entry.styleScale, 16),
+        base_opacity > 0 and base_shape[1] or 0,
+        base_shape[2],
+        quantized(base_shape[3], 1024),
+        quantized(base_shape[4], 1024),
+        longitudinal.shape,
+        quantized(longitudinal.endRadius, 1024),
+        quantized(longitudinal.primary, 1024)
     )
+    entry.key = entry.key .. ":" .. tostring(longitudinal.secondary)
     segment.paletteEntry = entry
     return entry
 end
@@ -545,17 +760,80 @@ local function paletteDistance(left, right)
     end
     local ratio_delta = (left.coreRatio - right.coreRatio) * 4
     local scale_delta = (left.styleScale - right.styleScale) / 64
-    return distance + ratio_delta * ratio_delta + scale_delta * scale_delta
+    local feature_distance = 0
+    if left.baseOpacity > 0 then
+        local base_opacity_delta = left.baseOpacity - right.baseOpacity
+        feature_distance = feature_distance
+            + base_opacity_delta * base_opacity_delta
+        for channel = 1, 3 do
+            local base_delta =
+                left.baseColor[channel] - right.baseColor[channel]
+            feature_distance = feature_distance + base_delta * base_delta
+        end
+    end
+    if left.fogInfluence > 0 then
+        local fog_delta = left.fogInfluence - right.fogInfluence
+        feature_distance = feature_distance + fog_delta * fog_delta
+    end
+    if left.minPixelWidth > 0 then
+        local pixel_delta =
+            (left.minPixelWidth - right.minPixelWidth) / 32
+        feature_distance = feature_distance + pixel_delta * pixel_delta
+    end
+    if left.depthSoftness > 0 then
+        local depth_delta =
+            (left.depthSoftness - right.depthSoftness) / 512
+        feature_distance = feature_distance + depth_delta * depth_delta
+    end
+    if left.startFadeLength > 0 then
+        local start_fade_delta = (
+            left.startFadeLength - right.startFadeLength
+        ) / FEATURE_DISTANCE_MAX
+        feature_distance = feature_distance
+            + start_fade_delta * start_fade_delta
+    end
+    if left.endFadeLength > 0 then
+        local end_fade_delta = (
+            left.endFadeLength - right.endFadeLength
+        ) / FEATURE_DISTANCE_MAX
+        feature_distance = feature_distance
+            + end_fade_delta * end_fade_delta
+    end
+    if left.longitudinal.taper then
+        local end_radius_delta =
+            (left.endRadius - right.endRadius) / 512
+        feature_distance = feature_distance
+            + end_radius_delta * end_radius_delta
+    end
+    if left.longitudinal.mode ~= "solid" then
+        local logarithmic_scale = math.log(1 + FEATURE_DISTANCE_MAX)
+        local primary_delta = (
+            math.log(1 + math.max(0, left.longitudinal.primary))
+                - math.log(1 + math.max(0, right.longitudinal.primary))
+        ) / logarithmic_scale
+        local secondary_delta = (
+            left.longitudinal.secondary - right.longitudinal.secondary
+        ) / 16777215
+        feature_distance = feature_distance
+            + primary_delta * primary_delta
+            + secondary_delta * secondary_delta
+    end
+    return distance
+        + ratio_delta * ratio_delta
+        + scale_delta * scale_delta
+        + feature_distance
 end
 
 local function nearestPaletteIndex(entry, palettes)
-    local best_index = 1
+    local best_index = nil
     local best_distance = math.huge
     for index, candidate in ipairs(palettes) do
-        local distance = paletteDistance(entry, candidate)
-        if distance < best_distance then
-            best_index = index
-            best_distance = distance
+        if candidate.classKey == entry.classKey then
+            local distance = paletteDistance(entry, candidate)
+            if distance < best_distance then
+                best_index = index
+                best_distance = distance
+            end
         end
     end
     return best_index
@@ -564,27 +842,56 @@ end
 local function buildPalettes(segments, count)
     local palettes = {}
     local by_key = {}
+    local by_class = {}
     local overflow = false
+
+    local function add(entry)
+        local existing = by_key[entry.key]
+        if existing ~= nil then
+            return existing
+        end
+        if #palettes >= MAX_SHADER_PALETTES then
+            return nil
+        end
+        local palette_index = #palettes + 1
+        palettes[palette_index] = entry
+        by_key[entry.key] = palette_index
+        by_class[entry.classKey] = true
+        return palette_index
+    end
+
+    -- Reserve one profile for every discrete behavior class before spending
+    -- spare entries on closer color/shape matches. Overflow may approximate
+    -- continuous values, but can never turn a mode or opt-in feature into
+    -- another behavior.
     for index = 1, count do
         local packed = segments[index]
         local entry = paletteEntry(packed.segment)
-        local key = entry.key
-        local palette_index = by_key[key]
-        if palette_index == nil then
-            if #palettes < MAX_SHADER_PALETTES then
-                palette_index = #palettes + 1
-                entry.key = key
-                palettes[palette_index] = entry
-                by_key[key] = palette_index
-            else
-                overflow = true
-                palette_index = nearestPaletteIndex(entry, palettes)
-                by_key[key] = palette_index
-            end
+        if not by_class[entry.classKey] and add(entry) == nil then
+            overflow = true
         end
-        packed.paletteIndex = palette_index - 1
     end
-    return palettes, overflow
+    for index = 1, count do
+        local entry = paletteEntry(segments[index].segment)
+        if by_key[entry.key] == nil and add(entry) == nil then
+            overflow = true
+        end
+    end
+
+    local renderable = {}
+    for index = 1, count do
+        local packed = segments[index]
+        local entry = paletteEntry(packed.segment)
+        local palette_index = by_key[entry.key]
+            or nearestPaletteIndex(entry, palettes)
+        if palette_index ~= nil then
+            packed.paletteIndex = palette_index - 1
+            renderable[#renderable + 1] = packed
+        else
+            overflow = true
+        end
+    end
+    return palettes, overflow, renderable
 end
 
 local function paletteSignature(palettes)
@@ -598,6 +905,8 @@ end
 local function writePaletteArrays(palettes)
     local outer = state.uniforms.paletteOuter
     local core = state.uniforms.paletteCore
+    local base_shape = state.uniforms.paletteBaseShape
+    local longitudinal = state.uniforms.paletteLongitudinal
     for index, entry in ipairs(palettes) do
         outer[index] = util.vector4(
             entry.color[1],
@@ -611,10 +920,132 @@ local function writePaletteArrays(palettes)
             entry.coreColor[3],
             entry.styleScale
         )
+        base_shape[index] = util.vector4(
+            entry.baseShape[1],
+            entry.baseShape[2],
+            entry.baseShape[3],
+            entry.baseShape[4]
+        )
+        longitudinal[index] = util.vector4(
+            entry.longitudinal.shape,
+            entry.longitudinal.endRadius,
+            entry.longitudinal.primary,
+            entry.longitudinal.secondary
+        )
     end
     for index = #palettes + 1, MAX_SHADER_PALETTES do
         outer[index] = ZERO_VECTOR4
         core[index] = ZERO_VECTOR4
+        base_shape[index] = ZERO_VECTOR4
+        longitudinal[index] = ZERO_VECTOR4
+    end
+end
+
+local function longitudinalPhase(segment, current_time)
+    local longitudinal = segment.longitudinal or { mode = "solid" }
+    local mode = longitudinal.mode or "solid"
+    if mode == "solid" then
+        return 0
+    end
+
+    local animation_started_at = tonumber(segment.animationStartedAt) or current_time
+    local age = math.max(0, current_time - animation_started_at)
+    local speed = tonumber(longitudinal.speed) or 0
+    local path_offset = tonumber(longitudinal.pathOffset) or 0
+
+    if mode == "travel" then
+        local visible_length = math.max(
+            FEATURE_DISTANCE_MIN,
+            tonumber(longitudinal.visibleLength) or FEATURE_DISTANCE_MIN
+        )
+        local travel_distance = math.abs(speed) * age
+        local loop_length = 0
+        if longitudinal.loop == true then
+            loop_length = math.max(
+                FEATURE_DISTANCE_MIN,
+                tonumber(longitudinal.loopLength) or segmentLength(segment)
+            )
+            local active_distance = loop_length + visible_length
+            local delay_distance = math.abs(speed)
+                * math.max(0, tonumber(longitudinal.loopDelay) or 0)
+            local cycle_distance = active_distance + delay_distance
+            travel_distance = positiveModulo(travel_distance, cycle_distance)
+            if travel_distance >= active_distance then
+                return 32768 + (
+                    math.floor(travel_distance * 257 + 0.5) % 32768
+                )
+            end
+        end
+
+        local current_segment_length = segmentLength(segment)
+        local oriented_path_offset = path_offset
+        if speed < 0 and longitudinal.loop == true then
+            -- Reverse travel begins at loopLength and visits connected
+            -- segments in decreasing path-coordinate order. The shader flips
+            -- local segment T; this offset supplies the matching global order.
+            oriented_path_offset = loop_length
+                - (path_offset + current_segment_length)
+        end
+        local local_head = travel_distance - oriented_path_offset
+        local active_local_length = current_segment_length + visible_length
+        if local_head <= 0 then
+            return 0
+        end
+        if local_head >= active_local_length then
+            return 32768 + (
+                math.floor(math.abs(local_head) * 257 + 0.5) % 32768
+            )
+        end
+        return math.max(
+            1,
+            math.min(
+                32767,
+                math.floor(
+                    local_head / active_local_length * 32767 + 0.5
+                )
+            )
+        )
+    end
+
+    local period
+    if mode == "pulse" then
+        period = tonumber(longitudinal.period) or FEATURE_DISTANCE_MIN
+    else
+        period = (tonumber(longitudinal.dashLength) or FEATURE_DISTANCE_MIN)
+            + math.max(0, tonumber(longitudinal.gapLength) or 0)
+    end
+    period = math.max(FEATURE_DISTANCE_MIN, period)
+    -- The shader adds this offset to distance along the segment. Subtracting
+    -- speed*time makes a positive speed move the visible pattern toward the
+    -- segment end while pathOffset keeps adjacent segments continuous.
+    local phase_distance = positiveModulo(
+        path_offset - speed * age,
+        period
+    )
+    return math.floor(phase_distance / period * UINT16_MAX + 0.5)
+end
+
+local function writeFeatureState(segments, count, current_time)
+    local packed_values = {}
+    for index = 1, count do
+        local packed = segments[index]
+        local lifecycle = quantizeUnit(packed.lifecycle or 1, UINT8_MAX)
+        local phase = longitudinalPhase(packed.segment, current_time)
+        packed_values[index] = lifecycle + phase * 256
+    end
+    for index = count + 1, MAX_SHADER_SEGMENTS do
+        packed_values[index] = 0
+    end
+
+    local feature_state = state.uniforms.featureState
+    for block = 1, MAX_SHADER_PALETTES do
+        local offset = (block - 1) * 4
+        feature_state[block] = util.vector4(
+            packed_values[offset + 1],
+            packed_values[offset + 2],
+            packed_values[offset + 3],
+            packed_values[offset + 4]
+        )
     end
 end
 
@@ -623,10 +1054,16 @@ local function upload(
     camera_pos,
     segments,
     active_count,
-    eligible_count
+    eligible_count,
+    current_time
 )
-    local count = math.min(#segments, MAX_SHADER_SEGMENTS)
-    local palettes, palette_overflow = buildPalettes(segments, count)
+    local candidate_count = math.min(#segments, MAX_SHADER_SEGMENTS)
+    local palettes, palette_overflow, renderable = buildPalettes(
+        segments,
+        candidate_count
+    )
+    segments = renderable
+    local count = #segments
     local new_palette_signature = paletteSignature(palettes)
     local palette_changed = new_palette_signature ~= state.paletteSignature
     if palette_changed then
@@ -635,6 +1072,7 @@ local function upload(
 
     local starts = state.uniforms.starts
     local ends = state.uniforms.ends
+    writeFeatureState(segments, count, current_time)
     for index = 1, count do
         local packed = segments[index]
         local segment = packed.segment
@@ -651,7 +1089,7 @@ local function upload(
             start_relative.x,
             start_relative.y,
             start_relative.z,
-            segment.width
+            segment.startRadius
         )
         ends[index] = util.vector4(
             end_relative.x,
@@ -669,9 +1107,21 @@ local function upload(
         if palette_changed then
             shader:setVector4Array("bfxPaletteOuterCore", state.uniforms.paletteOuter)
             shader:setVector4Array("bfxPaletteCoreGeometry", state.uniforms.paletteCore)
+            shader:setVector4Array(
+                "bfxPaletteBaseShape",
+                state.uniforms.paletteBaseShape
+            )
+            shader:setVector4Array(
+                "bfxPaletteLongitudinal",
+                state.uniforms.paletteLongitudinal
+            )
         end
         shader:setVector4Array("bfxSegmentStartRadius", starts)
         shader:setVector4Array("bfxSegmentEndMetadata", ends)
+        shader:setVector4Array(
+            "bfxSegmentFeatureState",
+            state.uniforms.featureState
+        )
         shader:setInt("bfxSegmentCount", count)
     end)
     if not ok then
@@ -690,6 +1140,7 @@ local function upload(
     state.diagnostics.uploadHealthy = true
     state.diagnostics.paletteCount = #palettes
     state.diagnostics.paletteOverflow = palette_overflow
+    state.diagnostics.renderedSegments = count
 
     state.lastUploadedCount = count
     if palette_changed then
@@ -697,17 +1148,18 @@ local function upload(
     end
 
     eligible_count = tonumber(eligible_count) or #segments
-    if eligible_count > MAX_SHADER_SEGMENTS
+    state.diagnostics.culledByCapacity = math.max(0, eligible_count - count)
+    if eligible_count > count
         and not state.overflowLogged
     then
         state.overflowLogged = true
         log.warn(string.format(
             "Beam visual capacity reached eligible=%d rendered=%d active=%d; gameplay remains active",
             eligible_count,
-            MAX_SHADER_SEGMENTS,
+            count,
             active_count
         ))
-    elseif eligible_count <= MAX_SHADER_SEGMENTS then
+    elseif eligible_count <= count then
         state.overflowLogged = false
     end
 
@@ -777,6 +1229,7 @@ local function renderBeamFromPacket(packet)
         compositeRenderKey = packet.compositeRenderKey,
         producerKey = protocol.producerKey(packet),
         revision = packet.revision,
+        animationStartedAt = packet.animationStartedAt,
         createdAt = lifecycle.createdAt,
         fadeStartAt = lifecycle.fadeStartAt,
         expiresAt = lifecycle.expiresAt,
@@ -893,7 +1346,8 @@ function beam_renderer.onFrame()
         camera_pos,
         segments,
         active_count,
-        state.diagnostics.eligibleSegments
+        state.diagnostics.eligibleSegments,
+        current_time
     ) then
         disableShader(true)
         state.nextUploadRetryAt =

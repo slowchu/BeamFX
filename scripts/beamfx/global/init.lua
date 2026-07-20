@@ -6,6 +6,7 @@ local util = require("openmw.util")
 local world = require("openmw.world")
 
 local constants = require("scripts.beamfx.shared.constants")
+local authoring = require("scripts.beamfx.shared.authoring")
 local log = require("scripts.beamfx.shared.log").new("global.init")
 local protocol = require("scripts.beamfx.shared.protocol")
 local space = require("scripts.beamfx.shared.space")
@@ -181,8 +182,26 @@ local function capabilities()
         version = constants.PACKAGE_VERSION,
         protocolVersion = constants.PROTOCOL_VERSION,
         shaderAbi = constants.SHADER_ABI,
+        shaderResource = constants.SHADER_RESOURCE,
         producerApiShape = constants.PRODUCER_API_SHAPE,
         styles = styles.names(),
+        presets = authoring.presetNames(),
+        producerMethods = {
+            "upsert",
+            "emit",
+            "upsertPath",
+            "replaceSegments",
+            "appendSegments",
+            "renew",
+            "finish",
+            "remove",
+            "clear",
+            "release",
+            "stats",
+        },
+        convenienceMethods = { "emit", "upsertPath" },
+        longitudinalModes = { "solid", "travel", "pulse", "dash" },
+        minPixelWidthStyles = { "filament" },
         segmentCapacity = constants.SEGMENT_CAPACITY,
         paletteCapacity = constants.PALETTE_CAPACITY,
         lifecycleModes = { "transient", "persistent" },
@@ -200,6 +219,19 @@ local function capabilities()
             playerPostprocessing = true,
             perViewerRouting = true,
             targetedReconciliation = true,
+            segmentTaper = true,
+            segmentMinPixelWidth = true,
+            segmentBaseMaterial = true,
+            segmentSpatialFades = true,
+            segmentSoftDepth = true,
+            segmentFogInfluence = true,
+            segmentLongitudinal = true,
+            appearancePresets = true,
+            colorShorthand = true,
+            segmentDefaults = true,
+            producerEmit = true,
+            producerPaths = true,
+            structuredErrorDetails = true,
         },
         quotas = quotas,
         fairness = {

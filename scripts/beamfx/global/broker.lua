@@ -64,6 +64,47 @@ local function copyColor(value)
     return { value[1], value[2], value[3] }
 end
 
+local function copyLongitudinal(value)
+    if value.mode == "solid" then
+        return {
+            mode = value.mode,
+            pathOffset = value.pathOffset,
+        }
+    end
+    if value.mode == "travel" then
+        return {
+            mode = value.mode,
+            pathOffset = value.pathOffset,
+            visibleLength = value.visibleLength,
+            speed = value.speed,
+            headFadeLength = value.headFadeLength,
+            tailFadeLength = value.tailFadeLength,
+            loop = value.loop == true,
+            loopLength = value.loopLength,
+            loopDelay = value.loopDelay,
+        }
+    end
+    if value.mode == "pulse" then
+        return {
+            mode = value.mode,
+            pathOffset = value.pathOffset,
+            period = value.period,
+            pulseLength = value.pulseLength,
+            speed = value.speed,
+            carrierLevel = value.carrierLevel,
+            fadeLength = value.fadeLength,
+        }
+    end
+    return {
+        mode = value.mode,
+        pathOffset = value.pathOffset,
+        dashLength = value.dashLength,
+        gapLength = value.gapLength,
+        speed = value.speed,
+        fadeLength = value.fadeLength,
+    }
+end
+
 local function copyAudience(value)
     return { mode = value.mode }
 end
@@ -82,16 +123,25 @@ local function copySegmentForPacket(value)
     return {
         startPos = copyVector(value.startPos),
         endPos = copyVector(value.endPos),
-        radius = value.radius,
+        startRadius = value.startRadius,
+        endRadius = value.endRadius,
+        minPixelWidth = value.minPixelWidth,
         outerColor = copyColor(value.outerColor),
         coreColor = copyColor(value.coreColor),
         coreRatio = value.coreRatio,
         intensity = value.intensity,
         opacity = value.opacity,
+        baseColor = copyColor(value.baseColor),
+        baseOpacity = value.baseOpacity,
+        startFadeLength = value.startFadeLength,
+        endFadeLength = value.endFadeLength,
+        depthSoftness = value.depthSoftness,
+        fogInfluence = value.fogInfluence,
         style = value.style,
         styleScale = value.styleScale,
         seed = value.seed,
         originGlow = value.originGlow == true,
+        longitudinal = copyLongitudinal(value.longitudinal),
         createdAt = value.createdAt,
         fadeStartAt = value.fadeStartAt,
         expiresAt = value.expiresAt,
@@ -348,16 +398,25 @@ function broker.new(options)
         local value = {
             startPos = copyVector(normalized.startPos),
             endPos = copyVector(normalized.endPos),
-            radius = normalized.radius,
+            startRadius = normalized.startRadius,
+            endRadius = normalized.endRadius,
+            minPixelWidth = normalized.minPixelWidth,
             outerColor = copyColor(normalized.outerColor),
             coreColor = copyColor(normalized.coreColor),
             coreRatio = normalized.coreRatio,
             intensity = normalized.intensity,
             opacity = normalized.opacity,
+            baseColor = copyColor(normalized.baseColor),
+            baseOpacity = normalized.baseOpacity,
+            startFadeLength = normalized.startFadeLength,
+            endFadeLength = normalized.endFadeLength,
+            depthSoftness = normalized.depthSoftness,
+            fogInfluence = normalized.fogInfluence,
             style = normalized.style,
             styleScale = normalized.styleScale,
             seed = normalized.seed,
             originGlow = normalized.originGlow == true,
+            longitudinal = copyLongitudinal(normalized.longitudinal),
             internalSerial = serial,
             createdAt = now,
             fadeStartAt = nil,
@@ -412,6 +471,7 @@ function broker.new(options)
             priority = normalized.priority,
             maxSegments = normalized.maxSegments,
             lifecycle = makeLifecycle(normalized.lifecycle, now),
+            animationStartedAt = now,
             segments = {},
             nextSegmentSerial = 0,
             status = "active",
@@ -462,9 +522,10 @@ function broker.new(options)
             return nil, err
         end
         local normalized
-        normalized, err = validation.normalizeBeamSpec(spec)
+        local detail
+        normalized, err, detail = validation.normalizeBeamSpec(spec)
         if normalized == nil then
-            return nil, err
+            return nil, err, detail
         end
         local now
         now, err = currentTime()
@@ -514,6 +575,7 @@ function broker.new(options)
             current.priority = normalized.priority
             current.maxSegments = normalized.maxSegments
             current.lifecycle = makeLifecycle(normalized.lifecycle, now)
+            current.animationStartedAt = now
             current.segments = segments
             current.nextSegmentSerial = next_serial
             current.status = "active"
@@ -580,6 +642,23 @@ function broker.new(options)
         }
     end
 
+    -- The facade generates emit IDs. Refusing an occupied ID here makes the
+    -- uniqueness check atomic with insertion and prevents accidental upsert.
+    local function emit(record, local_beam_id, spec)
+        local normalized_id, err = normalizeBeamId(local_beam_id)
+        if normalized_id == nil then
+            return nil, err
+        end
+        if record.beamsById[normalized_id] ~= nil then
+            return nil, "beam_id_in_use", {
+                path = "",
+                reason = "generated_id_collision",
+                message = "The generated emit ID is already in use.",
+            }
+        end
+        return upsert(record, normalized_id, spec)
+    end
+
     local function replaceSegments(record, local_beam_id, segments, options)
         local normalized_id, err = normalizeBeamId(local_beam_id)
         if normalized_id == nil then
@@ -599,13 +678,14 @@ function broker.new(options)
         end
 
         local normalized
-        normalized, err = validation.normalizeSegments(
+        local detail
+        normalized, err, detail = validation.normalizeSegments(
             segments,
             beam.maxSegments,
             options
         )
         if normalized == nil then
-            return nil, err
+            return nil, err, detail
         end
         local stamped, next_serial
         stamped, next_serial, err = stampSegments(
@@ -664,13 +744,14 @@ function broker.new(options)
         end
 
         local normalized
-        normalized, err = validation.normalizeSegments(
+        local detail
+        normalized, err, detail = validation.normalizeSegments(
             segments,
             beam.maxSegments,
             options
         )
         if normalized == nil then
-            return nil, err
+            return nil, err, detail
         end
         local stamped, next_serial
         stamped, next_serial, err = stampSegments(
@@ -990,6 +1071,7 @@ function broker.new(options)
 
     local operations = {
         upsert = upsert,
+        emit = emit,
         replaceSegments = replaceSegments,
         appendSegments = appendSegments,
         renew = renew,
@@ -1011,6 +1093,7 @@ function broker.new(options)
 
     local function resultMutated(operation, result)
         if operation == "upsert"
+            or operation == "emit"
             or operation == "replaceSegments"
             or operation == "appendSegments"
             or operation == "renew"
@@ -1049,7 +1132,9 @@ function broker.new(options)
                     + accepted_segments
         end
 
-        if operation == "upsert" and result.created == true then
+        if (operation == "upsert" or operation == "emit")
+            and result.created == true
+        then
             state.diagnostics.createdBeamGenerations =
                 state.diagnostics.createdBeamGenerations + 1
             record.diagnostics.createdBeamGenerations =
@@ -1081,14 +1166,16 @@ function broker.new(options)
             return nil, err
         end
         local result
+        local detail
         if colon_call then
-            result, err = handler(record, ...)
+            result, err, detail = handler(record, ...)
         else
-            result, err = handler(record, first_argument, ...)
+            result, err, detail =
+                handler(record, first_argument, ...)
         end
         if result == nil then
             recordInvalidRequest(record)
-            return nil, err
+            return nil, err, detail
         end
         recordSuccessfulResult(record, operation, result)
         return result
@@ -1233,6 +1320,7 @@ function broker.new(options)
         result.audience = copyAudience(beam.audience)
         result.priority = beam.priority
         result.lifecycle = copyLifecycleForPacket(beam.lifecycle)
+        result.animationStartedAt = beam.animationStartedAt
         result.segments = segments
         return result
     end

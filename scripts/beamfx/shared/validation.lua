@@ -37,17 +37,62 @@ local SEGMENT_KEYS = {
     startPos = true,
     endPos = true,
     radius = true,
+    startRadius = true,
+    endRadius = true,
+    minPixelWidth = true,
     outerColor = true,
     coreColor = true,
     coreRatio = true,
     intensity = true,
     opacity = true,
+    baseColor = true,
+    baseOpacity = true,
+    startFadeLength = true,
+    endFadeLength = true,
+    depthSoftness = true,
+    fogInfluence = true,
     style = true,
     styleScale = true,
     seed = true,
     originGlow = true,
+    longitudinal = true,
     duration = true,
     fadeDuration = true,
+}
+
+local LONGITUDINAL_MODE_KEYS = {
+    solid = {
+        mode = true,
+        pathOffset = true,
+    },
+    travel = {
+        mode = true,
+        pathOffset = true,
+        visibleLength = true,
+        speed = true,
+        headFadeLength = true,
+        tailFadeLength = true,
+        loop = true,
+        loopLength = true,
+        loopDelay = true,
+    },
+    pulse = {
+        mode = true,
+        pathOffset = true,
+        period = true,
+        pulseLength = true,
+        speed = true,
+        carrierLevel = true,
+        fadeLength = true,
+    },
+    dash = {
+        mode = true,
+        pathOffset = true,
+        dashLength = true,
+        gapLength = true,
+        speed = true,
+        fadeLength = true,
+    },
 }
 
 local SEGMENT_OPTIONS_KEYS = {
@@ -87,6 +132,49 @@ local function hasOnlyKeys(value, allowed)
         end
     end
     return true
+end
+
+local function firstUnknownKey(value, allowed)
+    if type(value) ~= "table" then
+        return nil
+    end
+    for key in next, value do
+        if type(key) ~= "string" or not allowed[key] then
+            return key
+        end
+    end
+    return nil
+end
+
+local function errorDetail(path, reason, message)
+    return {
+        path = path or "",
+        reason = reason,
+        message = message,
+    }
+end
+
+local function invalid(code, path, reason, message)
+    return nil, code, errorDetail(path, reason, message)
+end
+
+local function prefixDetail(detail, prefix)
+    if type(detail) ~= "table" then
+        return detail
+    end
+    local path = detail.path or ""
+    if path == "" then
+        path = prefix
+    elseif path:sub(1, 1) == "[" then
+        path = prefix .. path
+    else
+        path = prefix .. "." .. path
+    end
+    return {
+        path = path,
+        reason = detail.reason,
+        message = detail.message,
+    }
 end
 
 local function boundedString(value, maximum, allow_empty)
@@ -170,6 +258,18 @@ local function normalizeColor(value, fallback)
     }
 end
 
+local function normalizeBaseColor(value, fallback)
+    local result, err = normalizeColor(value, fallback)
+    if result == nil then
+        return nil, err
+    end
+    return {
+        clamp(result[1], 0, 1),
+        clamp(result[2], 0, 1),
+        clamp(result[3], 0, 1),
+    }
+end
+
 local function normalizeFinite(value, fallback, minimum, maximum)
     if value == nil then
         value = fallback
@@ -178,6 +278,28 @@ local function normalizeFinite(value, fallback, minimum, maximum)
         return nil, "invalid_spec"
     end
     return clamp(value, minimum, maximum)
+end
+
+local function normalizeNonzeroSpeed(value)
+    if not isFinite(value) or value == 0 then
+        return nil, "invalid_spec"
+    end
+    local magnitude = clamp(
+        math.abs(value),
+        constants.MIN_LONGITUDINAL_LENGTH,
+        constants.MAX_LONGITUDINAL_SPEED
+    )
+    if value < 0 then
+        magnitude = -magnitude
+    end
+    return magnitude
+end
+
+local function vectorDistance(left, right)
+    local x = right.x - left.x
+    local y = right.y - left.y
+    local z = right.z - left.z
+    return math.sqrt(x * x + y * y + z * z)
 end
 
 local function arrayLength(value, hard_maximum)
@@ -397,20 +519,277 @@ function validation.normalizeMaxSegments(value)
     return math.floor(clamp(value, 1, constants.MAX_SEGMENTS_PER_BEAM))
 end
 
+function validation.normalizeLongitudinal(value, segment_length)
+    if value == nil or value == false then
+        return {
+            mode = constants.DEFAULT_LONGITUDINAL_MODE,
+            pathOffset = constants.DEFAULT_LONGITUDINAL_PATH_OFFSET,
+        }
+    end
+    if type(value) ~= "table" then
+        return nil, "invalid_spec"
+    end
+
+    local mode = rawget(value, "mode")
+    if mode == nil then
+        mode = constants.DEFAULT_LONGITUDINAL_MODE
+    elseif type(mode) == "string" then
+        mode = mode:lower()
+    end
+    local allowed_keys = LONGITUDINAL_MODE_KEYS[mode]
+    if allowed_keys == nil or not hasOnlyKeys(value, allowed_keys) then
+        return nil, "invalid_spec"
+    end
+
+    local path_offset, err = normalizeFinite(
+        rawget(value, "pathOffset"),
+        constants.DEFAULT_LONGITUDINAL_PATH_OFFSET,
+        -constants.MAX_LONGITUDINAL_DISTANCE,
+        constants.MAX_LONGITUDINAL_DISTANCE
+    )
+    if path_offset == nil then
+        return nil, err
+    end
+
+    if mode == "solid" then
+        return {
+            mode = mode,
+            pathOffset = path_offset,
+        }
+    end
+
+    if not isFinite(segment_length) or segment_length <= 0 then
+        return nil, "invalid_spec"
+    end
+
+    if mode == "travel" then
+        local visible_length
+        visible_length, err = normalizeFinite(
+            rawget(value, "visibleLength"),
+            nil,
+            constants.MIN_LONGITUDINAL_LENGTH,
+            constants.MAX_LONGITUDINAL_DISTANCE
+        )
+        if visible_length == nil then
+            return nil, err
+        end
+        local speed
+        speed, err = normalizeNonzeroSpeed(rawget(value, "speed"))
+        if speed == nil then
+            return nil, err
+        end
+        local head_fade_length
+        head_fade_length, err = normalizeFinite(
+            rawget(value, "headFadeLength"),
+            0,
+            0,
+            visible_length
+        )
+        if head_fade_length == nil then
+            return nil, err
+        end
+        local tail_fade_length
+        tail_fade_length, err = normalizeFinite(
+            rawget(value, "tailFadeLength"),
+            0,
+            0,
+            visible_length
+        )
+        if tail_fade_length == nil then
+            return nil, err
+        end
+
+        local loop = rawget(value, "loop")
+        if loop == nil then
+            loop = false
+        elseif type(loop) ~= "boolean" then
+            return nil, "invalid_spec"
+        end
+        local supplied_loop_length = rawget(value, "loopLength")
+        local supplied_loop_delay = rawget(value, "loopDelay")
+        if not loop
+            and (supplied_loop_length ~= nil or supplied_loop_delay ~= nil)
+        then
+            return nil, "invalid_spec"
+        end
+
+        local loop_length = 0
+        local loop_delay = 0
+        if loop then
+            loop_length, err = normalizeFinite(
+                supplied_loop_length,
+                segment_length,
+                constants.MIN_LONGITUDINAL_LENGTH,
+                constants.MAX_LONGITUDINAL_DISTANCE
+            )
+            if loop_length == nil then
+                return nil, err
+            end
+            loop_delay, err = normalizeFinite(
+                supplied_loop_delay,
+                0,
+                0,
+                constants.MAX_LONGITUDINAL_LOOP_DELAY
+            )
+            if loop_delay == nil then
+                return nil, err
+            end
+        end
+
+        return {
+            mode = mode,
+            pathOffset = path_offset,
+            visibleLength = visible_length,
+            speed = speed,
+            headFadeLength = head_fade_length,
+            tailFadeLength = tail_fade_length,
+            loop = loop,
+            loopLength = loop_length,
+            loopDelay = loop_delay,
+        }
+    end
+
+    if mode == "pulse" then
+        local period
+        period, err = normalizeFinite(
+            rawget(value, "period"),
+            nil,
+            constants.MIN_LONGITUDINAL_LENGTH,
+            constants.MAX_LONGITUDINAL_DISTANCE
+        )
+        if period == nil then
+            return nil, err
+        end
+        local pulse_length
+        pulse_length, err = normalizeFinite(
+            rawget(value, "pulseLength"),
+            nil,
+            constants.MIN_LONGITUDINAL_LENGTH,
+            period
+        )
+        if pulse_length == nil then
+            return nil, err
+        end
+        local speed
+        speed, err = normalizeFinite(
+            rawget(value, "speed"),
+            constants.DEFAULT_LONGITUDINAL_SPEED,
+            -constants.MAX_LONGITUDINAL_SPEED,
+            constants.MAX_LONGITUDINAL_SPEED
+        )
+        if speed == nil then
+            return nil, err
+        end
+        local carrier_level
+        carrier_level, err = normalizeFinite(
+            rawget(value, "carrierLevel"),
+            constants.DEFAULT_PULSE_CARRIER_LEVEL,
+            0,
+            1
+        )
+        if carrier_level == nil then
+            return nil, err
+        end
+        local fade_length
+        fade_length, err = normalizeFinite(
+            rawget(value, "fadeLength"),
+            0,
+            0,
+            pulse_length * 0.5
+        )
+        if fade_length == nil then
+            return nil, err
+        end
+        return {
+            mode = mode,
+            pathOffset = path_offset,
+            period = period,
+            pulseLength = pulse_length,
+            speed = speed,
+            carrierLevel = carrier_level,
+            fadeLength = fade_length,
+        }
+    end
+
+    local dash_length
+    dash_length, err = normalizeFinite(
+        rawget(value, "dashLength"),
+        nil,
+        constants.MIN_LONGITUDINAL_LENGTH,
+        constants.MAX_LONGITUDINAL_DISTANCE
+    )
+    if dash_length == nil then
+        return nil, err
+    end
+    local gap_length
+    gap_length, err = normalizeFinite(
+        rawget(value, "gapLength"),
+        nil,
+        0,
+        constants.MAX_LONGITUDINAL_DISTANCE
+    )
+    if gap_length == nil then
+        return nil, err
+    end
+    local speed
+    speed, err = normalizeFinite(
+        rawget(value, "speed"),
+        constants.DEFAULT_LONGITUDINAL_SPEED,
+        -constants.MAX_LONGITUDINAL_SPEED,
+        constants.MAX_LONGITUDINAL_SPEED
+    )
+    if speed == nil then
+        return nil, err
+    end
+    local fade_length
+    fade_length, err = normalizeFinite(
+        rawget(value, "fadeLength"),
+        0,
+        0,
+        dash_length * 0.5
+    )
+    if fade_length == nil then
+        return nil, err
+    end
+    return {
+        mode = mode,
+        pathOffset = path_offset,
+        dashLength = dash_length,
+        gapLength = gap_length,
+        speed = speed,
+        fadeLength = fade_length,
+    }
+end
+
 function validation.normalizeSegmentOptions(value)
     if value == nil then
         return {}
     end
     if not hasOnlyKeys(value, SEGMENT_OPTIONS_KEYS) then
-        return nil, "invalid_spec"
+        return invalid(
+            "invalid_spec",
+            "options",
+            "invalid_segment_options",
+            "Expected only duration and fadeDuration options."
+        )
     end
     local duration = rawget(value, "duration")
     local fade_duration = rawget(value, "fadeDuration")
     if duration ~= nil and (not isFinite(duration) or duration <= 0) then
-        return nil, "invalid_spec"
+        return invalid(
+            "invalid_spec",
+            "options.duration",
+            "invalid_duration",
+            "duration must be a positive finite number."
+        )
     end
     if fade_duration ~= nil and (not isFinite(fade_duration) or fade_duration < 0) then
-        return nil, "invalid_spec"
+        return invalid(
+            "invalid_spec",
+            "options.fadeDuration",
+            "invalid_duration",
+            "fadeDuration must be a non-negative finite number."
+        )
     end
     if duration ~= nil and fade_duration ~= nil then
         fade_duration = math.min(fade_duration, duration)
@@ -423,85 +802,49 @@ end
 
 function validation.normalizeSegment(value, operation_options)
     if not hasOnlyKeys(value, SEGMENT_KEYS) then
-        return nil, "invalid_spec"
+        if type(value) ~= "table" then
+            return invalid(
+                "invalid_spec",
+                "",
+                "expected_table",
+                "Expected a segment table."
+            )
+        end
+        local unknown = firstUnknownKey(value, SEGMENT_KEYS)
+        return invalid(
+            "invalid_spec",
+            tostring(unknown or ""),
+            "unknown_field",
+            "This field is not supported by a BeamFX segment."
+        )
     end
     local err
-    operation_options, err = validation.normalizeSegmentOptions(operation_options)
+    local detail
+    operation_options, err, detail =
+        validation.normalizeSegmentOptions(operation_options)
     if operation_options == nil then
-        return nil, err
+        return nil, err, detail
     end
 
     local start_pos
     start_pos, err = normalizeVector(rawget(value, "startPos"))
     if start_pos == nil then
-        return nil, err
+        return invalid(
+            err,
+            "startPos",
+            "invalid_vector",
+            "Expected a finite world-space 3D position."
+        )
     end
     local end_pos
     end_pos, err = normalizeVector(rawget(value, "endPos"))
     if end_pos == nil then
-        return nil, err
-    end
-    local outer_color
-    outer_color, err = normalizeColor(
-        rawget(value, "outerColor"),
-        constants.DEFAULT_OUTER_COLOR
-    )
-    if outer_color == nil then
-        return nil, err
-    end
-    local core_color
-    core_color, err = normalizeColor(
-        rawget(value, "coreColor"),
-        constants.DEFAULT_CORE_COLOR
-    )
-    if core_color == nil then
-        return nil, err
-    end
-
-    local radius
-    radius, err = normalizeFinite(rawget(value, "radius"), constants.DEFAULT_RADIUS, 0.25, 512)
-    if radius == nil then
-        return nil, err
-    end
-    local core_ratio
-    core_ratio, err = normalizeFinite(
-        rawget(value, "coreRatio"),
-        constants.DEFAULT_CORE_RATIO,
-        0.02,
-        1
-    )
-    if core_ratio == nil then
-        return nil, err
-    end
-    local intensity
-    intensity, err = normalizeFinite(
-        rawget(value, "intensity"),
-        constants.DEFAULT_INTENSITY,
-        0,
-        8
-    )
-    if intensity == nil then
-        return nil, err
-    end
-    local opacity
-    opacity, err = normalizeFinite(
-        rawget(value, "opacity"),
-        constants.DEFAULT_OPACITY,
-        0,
-        1
-    )
-    if opacity == nil then
-        return nil, err
-    end
-    local style_scale
-    style_scale, err = normalizeFinite(
-        rawget(value, "styleScale"),
-        constants.DEFAULT_STYLE_SCALE,
-        0,
-        512
-    )
-    if style_scale == nil then
-        return nil, err
+        return invalid(
+            err,
+            "endPos",
+            "invalid_vector",
+            "Expected a finite world-space 3D position."
+        )
     end
 
     local style_value = rawget(value, "style")
@@ -511,15 +854,309 @@ function validation.normalizeSegment(value, operation_options)
     else
         style = styles.canonical(style_value)
         if style == nil then
-            return nil, "invalid_style"
+            return invalid(
+                "invalid_style",
+                "style",
+                "unknown_style",
+                "Unknown BeamFX shader style."
+            )
         end
+    end
+
+    local outer_color
+    outer_color, err = normalizeColor(
+        rawget(value, "outerColor"),
+        constants.DEFAULT_OUTER_COLOR
+    )
+    if outer_color == nil then
+        return invalid(
+            err,
+            "outerColor",
+            "invalid_color",
+            "Expected three finite color components."
+        )
+    end
+    local core_color
+    core_color, err = normalizeColor(
+        rawget(value, "coreColor"),
+        constants.DEFAULT_CORE_COLOR
+    )
+    if core_color == nil then
+        return invalid(
+            err,
+            "coreColor",
+            "invalid_color",
+            "Expected three finite color components."
+        )
+    end
+
+    local minimum_radius = constants.MIN_RADIUS
+    if style == "filament" then
+        minimum_radius = constants.MIN_FILAMENT_RADIUS
+    end
+    local radius
+    radius, err = normalizeFinite(
+        rawget(value, "radius"),
+        constants.DEFAULT_RADIUS,
+        minimum_radius,
+        constants.MAX_RADIUS
+    )
+    if radius == nil then
+        return invalid(
+            err,
+            "radius",
+            "invalid_number",
+            "radius must be a finite number."
+        )
+    end
+
+    local function endpointRadius(name)
+        local supplied = rawget(value, name)
+        if supplied == nil then
+            return radius
+        end
+        if not isFinite(supplied) then
+            return nil, "invalid_spec"
+        end
+        if supplied == 0 then
+            return 0
+        end
+        return clamp(supplied, minimum_radius, constants.MAX_RADIUS)
+    end
+
+    local start_radius
+    start_radius, err = endpointRadius("startRadius")
+    if start_radius == nil then
+        return invalid(
+            err,
+            "startRadius",
+            "invalid_number",
+            "startRadius must be a finite number."
+        )
+    end
+    local end_radius
+    end_radius, err = endpointRadius("endRadius")
+    if end_radius == nil then
+        return invalid(
+            err,
+            "endRadius",
+            "invalid_number",
+            "endRadius must be a finite number."
+        )
+    end
+
+    local minimum_pixel_width
+    minimum_pixel_width, err = normalizeFinite(
+        rawget(value, "minPixelWidth"),
+        constants.DEFAULT_MIN_PIXEL_WIDTH,
+        0,
+        constants.MAX_MIN_PIXEL_WIDTH
+    )
+    if minimum_pixel_width == nil then
+        return invalid(
+            err,
+            "minPixelWidth",
+            "invalid_number",
+            "minPixelWidth must be a finite number."
+        )
+    end
+    if minimum_pixel_width > 0 and style ~= "filament" then
+        return invalid(
+            "invalid_spec",
+            "minPixelWidth",
+            "requires_filament",
+            "minPixelWidth is only supported by the filament style."
+        )
+    end
+    if start_radius == 0
+        and end_radius == 0
+        and minimum_pixel_width == 0
+    then
+        return invalid(
+            "invalid_spec",
+            "startRadius",
+            "invisible_segment",
+            "Both endpoint radii require a positive filament pixel width."
+        )
+    end
+
+    local core_ratio
+    core_ratio, err = normalizeFinite(
+        rawget(value, "coreRatio"),
+        constants.DEFAULT_CORE_RATIO,
+        0.02,
+        1
+    )
+    if core_ratio == nil then
+        return invalid(
+            err,
+            "coreRatio",
+            "invalid_number",
+            "coreRatio must be a finite number."
+        )
+    end
+    local intensity
+    intensity, err = normalizeFinite(
+        rawget(value, "intensity"),
+        constants.DEFAULT_INTENSITY,
+        0,
+        8
+    )
+    if intensity == nil then
+        return invalid(
+            err,
+            "intensity",
+            "invalid_number",
+            "intensity must be a finite number."
+        )
+    end
+    local opacity
+    opacity, err = normalizeFinite(
+        rawget(value, "opacity"),
+        constants.DEFAULT_OPACITY,
+        0,
+        1
+    )
+    if opacity == nil then
+        return invalid(
+            err,
+            "opacity",
+            "invalid_number",
+            "opacity must be a finite number."
+        )
+    end
+
+    local base_color
+    base_color, err = normalizeBaseColor(
+        rawget(value, "baseColor"),
+        outer_color
+    )
+    if base_color == nil then
+        return invalid(
+            err,
+            "baseColor",
+            "invalid_color",
+            "Expected three finite color components."
+        )
+    end
+    local base_opacity
+    base_opacity, err = normalizeFinite(
+        rawget(value, "baseOpacity"),
+        constants.DEFAULT_BASE_OPACITY,
+        0,
+        1
+    )
+    if base_opacity == nil then
+        return invalid(
+            err,
+            "baseOpacity",
+            "invalid_number",
+            "baseOpacity must be a finite number."
+        )
+    end
+
+    local start_fade_length
+    start_fade_length, err = normalizeFinite(
+        rawget(value, "startFadeLength"),
+        constants.DEFAULT_SPATIAL_FADE_LENGTH,
+        0,
+        constants.MAX_LONGITUDINAL_DISTANCE
+    )
+    if start_fade_length == nil then
+        return invalid(
+            err,
+            "startFadeLength",
+            "invalid_number",
+            "startFadeLength must be a finite number."
+        )
+    end
+    local end_fade_length
+    end_fade_length, err = normalizeFinite(
+        rawget(value, "endFadeLength"),
+        constants.DEFAULT_SPATIAL_FADE_LENGTH,
+        0,
+        constants.MAX_LONGITUDINAL_DISTANCE
+    )
+    if end_fade_length == nil then
+        return invalid(
+            err,
+            "endFadeLength",
+            "invalid_number",
+            "endFadeLength must be a finite number."
+        )
+    end
+
+    local depth_softness
+    depth_softness, err = normalizeFinite(
+        rawget(value, "depthSoftness"),
+        constants.DEFAULT_DEPTH_SOFTNESS,
+        0,
+        constants.MAX_DEPTH_SOFTNESS
+    )
+    if depth_softness == nil then
+        return invalid(
+            err,
+            "depthSoftness",
+            "invalid_number",
+            "depthSoftness must be a finite number."
+        )
+    end
+    local fog_influence
+    fog_influence, err = normalizeFinite(
+        rawget(value, "fogInfluence"),
+        constants.DEFAULT_FOG_INFLUENCE,
+        0,
+        1
+    )
+    if fog_influence == nil then
+        return invalid(
+            err,
+            "fogInfluence",
+            "invalid_number",
+            "fogInfluence must be a finite number."
+        )
+    end
+
+    local style_scale
+    style_scale, err = normalizeFinite(
+        rawget(value, "styleScale"),
+        constants.DEFAULT_STYLE_SCALE,
+        0,
+        512
+    )
+    if style_scale == nil then
+        return invalid(
+            err,
+            "styleScale",
+            "invalid_number",
+            "styleScale must be a finite number."
+        )
+    end
+
+    local longitudinal
+    longitudinal, err = validation.normalizeLongitudinal(
+        rawget(value, "longitudinal"),
+        vectorDistance(start_pos, end_pos)
+    )
+    if longitudinal == nil then
+        return invalid(
+            err,
+            "longitudinal",
+            "invalid_longitudinal",
+            "The longitudinal settings are not valid for this segment."
+        )
     end
 
     local origin_glow = rawget(value, "originGlow")
     if origin_glow == nil then
         origin_glow = false
     elseif type(origin_glow) ~= "boolean" then
-        return nil, "invalid_spec"
+        return invalid(
+            "invalid_spec",
+            "originGlow",
+            "invalid_boolean",
+            "originGlow must be true or false."
+        )
     end
     local seed = rawget(value, "seed")
     if seed ~= nil
@@ -528,15 +1165,30 @@ function validation.normalizeSegment(value, operation_options)
             or seed < 0
             or seed > 15)
     then
-        return nil, "invalid_spec"
+        return invalid(
+            "invalid_spec",
+            "seed",
+            "invalid_seed",
+            "seed must be an integer from 0 through 15."
+        )
     end
     if origin_glow then
         if style ~= "plasma" or (seed ~= nil and seed ~= 0) then
-            return nil, "invalid_spec"
+            return invalid(
+                "invalid_spec",
+                "originGlow",
+                "invalid_origin_glow",
+                "originGlow requires plasma with an omitted or zero seed."
+            )
         end
         seed = 0
     elseif style == "plasma" and seed == 0 then
-        return nil, "invalid_spec"
+        return invalid(
+            "invalid_spec",
+            "seed",
+            "reserved_plasma_seed",
+            "Plasma seed 0 is reserved for originGlow."
+        )
     end
 
     local duration = rawget(value, "duration")
@@ -547,28 +1199,54 @@ function validation.normalizeSegment(value, operation_options)
     if fade_duration == nil then
         fade_duration = operation_options.fadeDuration
     end
+    local duration_error_path = "duration"
+    if duration == nil and fade_duration ~= nil then
+        duration_error_path = "fadeDuration"
+    elseif duration ~= nil
+        and isFinite(duration)
+        and duration > 0
+        and fade_duration ~= nil
+        and (not isFinite(fade_duration) or fade_duration < 0)
+    then
+        duration_error_path = "fadeDuration"
+    end
     duration, fade_duration, err = normalizeRelativeDuration(
         duration,
         fade_duration,
         constants.DEFAULT_FINISH_FADE_DURATION
     )
     if err ~= nil then
-        return nil, err
+        return invalid(
+            err,
+            duration_error_path,
+            "invalid_duration",
+            "Segment duration and fadeDuration must be non-negative and finite."
+        )
     end
 
     return {
         startPos = start_pos,
         endPos = end_pos,
         radius = radius,
+        startRadius = start_radius,
+        endRadius = end_radius,
+        minPixelWidth = minimum_pixel_width,
         outerColor = outer_color,
         coreColor = core_color,
         coreRatio = core_ratio,
         intensity = intensity,
         opacity = opacity,
+        baseColor = base_color,
+        baseOpacity = base_opacity,
+        startFadeLength = start_fade_length,
+        endFadeLength = end_fade_length,
+        depthSoftness = depth_softness,
+        fogInfluence = fog_influence,
         style = style,
         styleScale = style_scale,
         seed = seed,
         originGlow = origin_glow,
+        longitudinal = longitudinal,
         duration = duration,
         fadeDuration = fade_duration,
     }
@@ -577,32 +1255,61 @@ end
 function validation.normalizeSegments(value, max_segments, operation_options)
     max_segments = max_segments or constants.DEFAULT_MAX_SEGMENTS
     if not isFinite(max_segments) then
-        return nil, "invalid_spec"
+        return invalid(
+            "invalid_spec",
+            "maxSegments",
+            "invalid_number",
+            "maxSegments must be a finite number."
+        )
     end
     max_segments = math.floor(clamp(max_segments, 1, constants.MAX_SEGMENTS_PER_BEAM))
 
-    local options, err = validation.normalizeSegmentOptions(operation_options)
+    local options, err, detail =
+        validation.normalizeSegmentOptions(operation_options)
     if options == nil then
-        return nil, err
+        return nil, err, detail
     end
     local count
     count, err = arrayLength(value, constants.MAX_INPUT_SEGMENTS)
     if count == nil then
-        return nil, err
+        return invalid(
+            err,
+            "segments",
+            err == "segment_quota_exceeded"
+                    and "segment_quota_exceeded"
+                or "invalid_array",
+            err == "segment_quota_exceeded"
+                    and "Too many input segments."
+                or "Expected a dense array of segment tables."
+        )
     end
     if count == 0 then
-        return nil, "no_valid_segments"
+        return invalid(
+            "no_valid_segments",
+            "segments",
+            "no_valid_segments",
+            "At least one segment is required."
+        )
     end
     if count > max_segments then
-        return nil, "segment_quota_exceeded"
+        return invalid(
+            "segment_quota_exceeded",
+            "segments",
+            "segment_quota_exceeded",
+            "The segment batch exceeds maxSegments."
+        )
     end
 
     local normalized = {}
     for index = 1, count do
         local segment
-        segment, err = validation.normalizeSegment(rawget(value, index), options)
+        segment, err, detail =
+            validation.normalizeSegment(rawget(value, index), options)
         if segment == nil then
-            return nil, err
+            return nil, err, prefixDetail(
+                detail,
+                "segments[" .. index .. "]"
+            )
         end
         normalized[index] = segment
     end
@@ -611,39 +1318,79 @@ end
 
 function validation.normalizeBeamSpec(value)
     if not hasOnlyKeys(value, BEAM_KEYS) then
-        return nil, "invalid_spec"
+        if type(value) ~= "table" then
+            return invalid(
+                "invalid_spec",
+                "",
+                "expected_table",
+                "Expected a beam specification table."
+            )
+        end
+        local unknown = firstUnknownKey(value, BEAM_KEYS)
+        return invalid(
+            "invalid_spec",
+            tostring(unknown or ""),
+            "unknown_field",
+            "This field is not supported by a BeamFX beam."
+        )
     end
     local space_key, err = validation.normalizeSpaceKey(rawget(value, "spaceKey"))
     if space_key == nil then
-        return nil, err
+        return invalid(
+            err,
+            "spaceKey",
+            "invalid_space_key",
+            "Expected a valid BeamFX interior or exterior space key."
+        )
     end
     local lifecycle
     lifecycle, err = validation.normalizeLifecycle(rawget(value, "lifecycle"))
     if lifecycle == nil then
-        return nil, err
+        return invalid(
+            err,
+            "lifecycle",
+            "invalid_lifecycle",
+            "Expected a valid transient or persistent lifecycle."
+        )
     end
     local audience
     audience, err = validation.normalizeAudience(rawget(value, "audience"))
     if audience == nil then
-        return nil, err
+        return invalid(
+            err,
+            "audience",
+            "invalid_audience",
+            "Only the same_space audience is supported."
+        )
     end
     local priority
     priority, err = validation.normalizePriority(rawget(value, "priority"))
     if priority == nil then
-        return nil, err
+        return invalid(
+            err,
+            "priority",
+            "invalid_priority",
+            "Expected low, normal, or high priority."
+        )
     end
     local max_segments
     max_segments, err = validation.normalizeMaxSegments(rawget(value, "maxSegments"))
     if max_segments == nil then
-        return nil, err
+        return invalid(
+            err,
+            "maxSegments",
+            "invalid_number",
+            "maxSegments must be a finite number."
+        )
     end
     local segments
-    segments, err = validation.normalizeSegments(
+    local detail
+    segments, err, detail = validation.normalizeSegments(
         rawget(value, "segments"),
         max_segments
     )
     if segments == nil then
-        return nil, err
+        return nil, err, detail
     end
     return {
         spaceKey = space_key,

@@ -247,6 +247,7 @@ function viewer_sync.new(options)
         identity.rendererSession = record.rendererSession
         identity.viewerSyncGeneration = record.viewerSyncGeneration
         identity.revision = beam.revision
+        identity.animationStartedAt = beam.animationStartedAt
         identity.spaceKey = beam.spaceKey
         identity.priority = beam.priority
         identity.lifecycle = beam.lifecycle

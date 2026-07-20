@@ -8,12 +8,12 @@ local protocol = {}
 protocol.VERSION = constants.PROTOCOL_VERSION
 
 protocol.events = {
-    RENDER_SNAPSHOT = "BeamFX_Internal_RenderSnapshot_v1",
-    RENDER_REMOVE = "BeamFX_Internal_RenderRemove_v1",
-    PROVIDER_RESET = "BeamFX_Internal_ProviderReset_v1",
-    VIEWER_RECONCILE_RESET = "BeamFX_Internal_ViewerReconcileReset_v1",
-    VIEWER_READY = "BeamFX_Internal_ViewerReady_v1",
-    VIEWER_RESYNC = "BeamFX_Internal_ViewerResync_v1",
+    RENDER_SNAPSHOT = "BeamFX_Internal_RenderSnapshot_v3",
+    RENDER_REMOVE = "BeamFX_Internal_RenderRemove_v3",
+    PROVIDER_RESET = "BeamFX_Internal_ProviderReset_v3",
+    VIEWER_RECONCILE_RESET = "BeamFX_Internal_ViewerReconcileReset_v3",
+    VIEWER_READY = "BeamFX_Internal_ViewerReady_v3",
+    VIEWER_RESYNC = "BeamFX_Internal_ViewerResync_v3",
 }
 
 local MAX_SAFE_INTEGER = 9007199254740991
@@ -24,7 +24,7 @@ local MAX_BEAM_ID_LENGTH = tonumber(constants.MAX_BEAM_ID_LENGTH) or 128
 local MAX_SPACE_KEY_LENGTH = tonumber(constants.MAX_SPACE_KEY_LENGTH) or 384
 local MAX_REASON_LENGTH = tonumber(constants.MAX_REASON_LENGTH) or 160
 local MAX_PACKET_DEPTH = 12
-local MAX_PACKET_VALUES = tonumber(constants.MAX_PACKET_VALUES) or 8192
+local MAX_PACKET_VALUES = tonumber(constants.MAX_PACKET_VALUES) or 16384
 local MAX_PACKET_SEGMENTS = tonumber(constants.MAX_INPUT_SEGMENTS)
     or tonumber(constants.MAX_SEGMENTS_PER_BEAM)
     or constants.SEGMENT_CAPACITY
@@ -40,6 +40,69 @@ local STYLES = {
     electric = true,
     plasma = true,
     trail = true,
+    filament = true,
+}
+
+local SEGMENT_KEYS = {
+    startPos = true,
+    endPos = true,
+    startRadius = true,
+    endRadius = true,
+    minPixelWidth = true,
+    outerColor = true,
+    coreColor = true,
+    coreRatio = true,
+    intensity = true,
+    opacity = true,
+    baseColor = true,
+    baseOpacity = true,
+    startFadeLength = true,
+    endFadeLength = true,
+    depthSoftness = true,
+    fogInfluence = true,
+    style = true,
+    styleScale = true,
+    seed = true,
+    originGlow = true,
+    longitudinal = true,
+    createdAt = true,
+    fadeStartAt = true,
+    expiresAt = true,
+}
+
+local LONGITUDINAL_MODE_KEYS = {
+    solid = {
+        mode = true,
+        pathOffset = true,
+    },
+    travel = {
+        mode = true,
+        pathOffset = true,
+        visibleLength = true,
+        speed = true,
+        headFadeLength = true,
+        tailFadeLength = true,
+        loop = true,
+        loopLength = true,
+        loopDelay = true,
+    },
+    pulse = {
+        mode = true,
+        pathOffset = true,
+        period = true,
+        pulseLength = true,
+        speed = true,
+        carrierLevel = true,
+        fadeLength = true,
+    },
+    dash = {
+        mode = true,
+        pathOffset = true,
+        dashLength = true,
+        gapLength = true,
+        speed = true,
+        fadeLength = true,
+    },
 }
 
 local LIFECYCLE_MODES = {
@@ -196,6 +259,166 @@ local function copyColor(value)
     return { red, green, blue }
 end
 
+local function copyBaseColor(value)
+    local result = copyColor(value)
+    if result == nil
+        or result[1] > 1
+        or result[2] > 1
+        or result[3] > 1
+    then
+        return nil
+    end
+    return result
+end
+
+local function hasExactStringKeys(value, allowed)
+    if type(value) ~= "table" then
+        return false
+    end
+    local actual = 0
+    for key in next, value do
+        if type(key) ~= "string" or not allowed[key] then
+            return false
+        end
+        actual = actual + 1
+    end
+    local expected = 0
+    for _ in pairs(allowed) do
+        expected = expected + 1
+    end
+    return actual == expected
+end
+
+local function validateLongitudinal(value)
+    if type(value) ~= "table" then
+        return nil
+    end
+    local mode = rawget(value, "mode")
+    local allowed = LONGITUDINAL_MODE_KEYS[mode]
+    if allowed == nil or not hasExactStringKeys(value, allowed) then
+        return nil
+    end
+    local path_offset = rawget(value, "pathOffset")
+    if not finiteNumber(path_offset)
+        or math.abs(path_offset) > constants.MAX_LONGITUDINAL_DISTANCE
+    then
+        return nil
+    end
+
+    if mode == "solid" then
+        return {
+            mode = mode,
+            pathOffset = path_offset,
+        }
+    end
+
+    local speed = rawget(value, "speed")
+    if not finiteNumber(speed)
+        or math.abs(speed) > constants.MAX_LONGITUDINAL_SPEED
+    then
+        return nil
+    end
+
+    if mode == "travel" then
+        local visible_length = rawget(value, "visibleLength")
+        local head_fade_length = rawget(value, "headFadeLength")
+        local tail_fade_length = rawget(value, "tailFadeLength")
+        local loop = rawget(value, "loop")
+        local loop_length = rawget(value, "loopLength")
+        local loop_delay = rawget(value, "loopDelay")
+        if not finiteNumber(visible_length)
+            or visible_length < constants.MIN_LONGITUDINAL_LENGTH
+            or visible_length > constants.MAX_LONGITUDINAL_DISTANCE
+            or speed == 0
+            or math.abs(speed) < constants.MIN_LONGITUDINAL_LENGTH
+            or not finiteNumber(head_fade_length)
+            or head_fade_length < 0
+            or head_fade_length > visible_length
+            or not finiteNumber(tail_fade_length)
+            or tail_fade_length < 0
+            or tail_fade_length > visible_length
+            or type(loop) ~= "boolean"
+            or not finiteNumber(loop_length)
+            or not finiteNumber(loop_delay)
+            or loop_delay < 0
+            or loop_delay > constants.MAX_LONGITUDINAL_LOOP_DELAY
+            or (not loop and (loop_length ~= 0 or loop_delay ~= 0))
+            or (loop and (
+                loop_length < constants.MIN_LONGITUDINAL_LENGTH
+                or loop_length > constants.MAX_LONGITUDINAL_DISTANCE
+            ))
+        then
+            return nil
+        end
+        return {
+            mode = mode,
+            pathOffset = path_offset,
+            visibleLength = visible_length,
+            speed = speed,
+            headFadeLength = head_fade_length,
+            tailFadeLength = tail_fade_length,
+            loop = loop,
+            loopLength = loop_length,
+            loopDelay = loop_delay,
+        }
+    end
+
+    if mode == "pulse" then
+        local period = rawget(value, "period")
+        local pulse_length = rawget(value, "pulseLength")
+        local carrier_level = rawget(value, "carrierLevel")
+        local fade_length = rawget(value, "fadeLength")
+        if not finiteNumber(period)
+            or period < constants.MIN_LONGITUDINAL_LENGTH
+            or period > constants.MAX_LONGITUDINAL_DISTANCE
+            or not finiteNumber(pulse_length)
+            or pulse_length < constants.MIN_LONGITUDINAL_LENGTH
+            or pulse_length > period
+            or not finiteNumber(carrier_level)
+            or carrier_level < 0
+            or carrier_level > 1
+            or not finiteNumber(fade_length)
+            or fade_length < 0
+            or fade_length > pulse_length * 0.5
+        then
+            return nil
+        end
+        return {
+            mode = mode,
+            pathOffset = path_offset,
+            period = period,
+            pulseLength = pulse_length,
+            speed = speed,
+            carrierLevel = carrier_level,
+            fadeLength = fade_length,
+        }
+    end
+
+    local dash_length = rawget(value, "dashLength")
+    local gap_length = rawget(value, "gapLength")
+    local fade_length = rawget(value, "fadeLength")
+    if not finiteNumber(dash_length)
+        or dash_length < constants.MIN_LONGITUDINAL_LENGTH
+        or dash_length > constants.MAX_LONGITUDINAL_DISTANCE
+        or not finiteNumber(gap_length)
+        or gap_length < 0
+        or gap_length > constants.MAX_LONGITUDINAL_DISTANCE
+        or not finiteNumber(fade_length)
+        or fade_length < 0
+        or fade_length > dash_length * 0.5
+    then
+        return nil
+    end
+    return {
+        mode = mode,
+        pathOffset = path_offset,
+        dashLength = dash_length,
+        gapLength = gap_length,
+        speed = speed,
+        fadeLength = fade_length,
+    }
+end
+
 local function optionalTimestamp(value)
     if value == nil then
         return nil, true
@@ -296,36 +519,92 @@ local function validateSegment(value)
     if type(value) ~= "table" then
         return nil, "invalid_segment"
     end
+    for key in next, value do
+        if type(key) ~= "string" or not SEGMENT_KEYS[key] then
+            return nil, "invalid_segment"
+        end
+    end
+
     local start_pos = copyVector3(value.startPos)
     local end_pos = copyVector3(value.endPos)
     local outer_color = copyColor(value.outerColor)
     local core_color = copyColor(value.coreColor)
-    local radius = rawget(value, "radius")
+    local base_color = copyBaseColor(value.baseColor)
+    local start_radius = rawget(value, "startRadius")
+    local end_radius = rawget(value, "endRadius")
+    local minimum_pixel_width = rawget(value, "minPixelWidth")
     local core_ratio = rawget(value, "coreRatio")
     local intensity = rawget(value, "intensity")
     local opacity = rawget(value, "opacity")
+    local base_opacity = rawget(value, "baseOpacity")
+    local start_fade_length = rawget(value, "startFadeLength")
+    local end_fade_length = rawget(value, "endFadeLength")
+    local depth_softness = rawget(value, "depthSoftness")
+    local fog_influence = rawget(value, "fogInfluence")
     local style_scale = rawget(value, "styleScale")
     local seed = rawget(value, "seed")
     local origin_glow = rawget(value, "originGlow")
+    local longitudinal = validateLongitudinal(value.longitudinal)
     local created_at = rawget(value, "createdAt")
     local fade_start_at, fade_ok = optionalTimestamp(value.fadeStartAt)
     local expires_at, expires_ok = optionalTimestamp(value.expiresAt)
 
+    local minimum_radius = constants.MIN_RADIUS
+    if value.style == "filament" then
+        minimum_radius = constants.MIN_FILAMENT_RADIUS
+    end
+    local start_radius_valid = finiteNumber(start_radius)
+        and start_radius <= constants.MAX_RADIUS
+        and (start_radius == 0 or start_radius >= minimum_radius)
+    local end_radius_valid = finiteNumber(end_radius)
+        and end_radius <= constants.MAX_RADIUS
+        and (end_radius == 0 or end_radius >= minimum_radius)
+
     if start_pos == nil or end_pos == nil
-        or outer_color == nil or core_color == nil
-        or not finiteNumber(radius) or radius < 0.25 or radius > 512
+        or outer_color == nil or core_color == nil or base_color == nil
+        or not STYLES[value.style]
+        or not start_radius_valid or not end_radius_valid
+        or not finiteNumber(minimum_pixel_width)
+        or minimum_pixel_width < 0
+        or minimum_pixel_width > constants.MAX_MIN_PIXEL_WIDTH
+        or (minimum_pixel_width > 0 and value.style ~= "filament")
+        or (start_radius == 0 and end_radius == 0
+            and minimum_pixel_width == 0)
         or not finiteNumber(core_ratio) or core_ratio < 0.02 or core_ratio > 1
         or not finiteNumber(intensity) or intensity < 0 or intensity > 8
         or not finiteNumber(opacity) or opacity < 0 or opacity > 1
-        or not STYLES[value.style]
+        or not finiteNumber(base_opacity)
+        or base_opacity < 0 or base_opacity > 1
+        or not finiteNumber(start_fade_length)
+        or start_fade_length < 0
+        or start_fade_length > constants.MAX_LONGITUDINAL_DISTANCE
+        or not finiteNumber(end_fade_length)
+        or end_fade_length < 0
+        or end_fade_length > constants.MAX_LONGITUDINAL_DISTANCE
+        or not finiteNumber(depth_softness)
+        or depth_softness < 0
+        or depth_softness > constants.MAX_DEPTH_SOFTNESS
+        or not finiteNumber(fog_influence)
+        or fog_influence < 0 or fog_influence > 1
         or not finiteNumber(style_scale) or style_scale < 0 or style_scale > 512
         or not safeInteger(seed, 0) or seed > 15
         or type(origin_glow) ~= "boolean"
+        or longitudinal == nil
         or not finiteNumber(created_at)
         or not fade_ok or not expires_ok
     then
         return nil, "invalid_segment"
     end
+
+    if longitudinal.mode ~= "solid" then
+        local x = end_pos.x - start_pos.x
+        local y = end_pos.y - start_pos.y
+        local z = end_pos.z - start_pos.z
+        if x * x + y * y + z * z <= 0 then
+            return nil, "invalid_segment"
+        end
+    end
+
     if origin_glow then
         if value.style ~= "plasma" or seed ~= 0 then
             return nil, "invalid_segment"
@@ -350,16 +629,25 @@ local function validateSegment(value)
     return {
         startPos = start_pos,
         endPos = end_pos,
-        radius = radius,
+        startRadius = start_radius,
+        endRadius = end_radius,
+        minPixelWidth = minimum_pixel_width,
         coreRatio = core_ratio,
         outerColor = outer_color,
         coreColor = core_color,
         intensity = intensity,
         opacity = opacity,
+        baseColor = base_color,
+        baseOpacity = base_opacity,
+        startFadeLength = start_fade_length,
+        endFadeLength = end_fade_length,
+        depthSoftness = depth_softness,
+        fogInfluence = fog_influence,
         style = value.style,
         styleScale = style_scale,
         seed = seed,
         originGlow = origin_glow,
+        longitudinal = longitudinal,
         createdAt = created_at,
         fadeStartAt = fade_start_at,
         expiresAt = expires_at,
@@ -412,6 +700,7 @@ function protocol.validateSnapshot(payload)
     )
     if not safeInteger(payload.viewerSyncGeneration, 1)
         or not safeInteger(payload.revision, 1)
+        or not finiteNumber(payload.animationStartedAt)
         or not boundedString(
             payload.rendererSession,
             MAX_RENDERER_SESSION_LENGTH
@@ -451,6 +740,7 @@ function protocol.validateSnapshot(payload)
         localBeamId = identity.localBeamId,
         beamGeneration = identity.beamGeneration,
         revision = payload.revision,
+        animationStartedAt = payload.animationStartedAt,
         spaceKey = payload.spaceKey,
         priority = payload.priority,
         lifecycle = lifecycle,

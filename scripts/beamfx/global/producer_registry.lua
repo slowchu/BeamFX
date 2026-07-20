@@ -1,6 +1,7 @@
 ---@omw-context global
 
 local constants = require("scripts.beamfx.shared.constants")
+local authoring = require("scripts.beamfx.shared.authoring")
 local validation = require("scripts.beamfx.shared.validation")
 
 local producer_registry = {}
@@ -9,6 +10,8 @@ local MAX_SAFE_INTEGER = 9007199254740991
 
 local FACADE_METHODS = {
     "upsert",
+    "emit",
+    "upsertPath",
     "replaceSegments",
     "appendSegments",
     "renew",
@@ -224,14 +227,19 @@ function producer_registry.new(options)
             return nil, "stale_producer"
         end
 
-        local call_ok, result, err = pcall(invoke, state, method_name, ...)
+        local call_ok, result, err, detail =
+            pcall(invoke, state, method_name, ...)
         if not call_ok then
             rejectBoundary(state, false)
             reportInternalError(on_error, method_name, state, result)
             return nil, "provider_reset"
         end
         if result == nil or result == false or err ~= nil then
-            return nil, stableCallbackError(err)
+            local detail_copy = nil
+            if detail ~= nil then
+                detail_copy = copyResult(detail)
+            end
+            return nil, stableCallbackError(err), detail_copy
         end
 
         local result_copy, copy_ok = copyResult(result)
@@ -243,20 +251,142 @@ function producer_registry.new(options)
         return result_copy
     end
 
+    local function expandForFacade(state, expander, ...)
+        if not isLive(state) then
+            rejectBoundary(state, true)
+            return nil, "stale_producer"
+        end
+        local value, err, detail = expander(...)
+        if value == nil then
+            rejectBoundary(state, false)
+            return nil, err, detail
+        end
+        return value
+    end
+
     local function makeFacade(state)
         local facade = {}
 
         -- The first argument is deliberately ignored. OpenMW may proxy the
         -- facade table across sandboxes, so identity-checking colon-call self
         -- would reject a legitimate capability.
-        facade.upsert = function(_, ...)
-            return callBroker(state, "upsert", ...)
+        facade.upsert = function(_, local_beam_id, spec)
+            local expanded, err, detail = expandForFacade(
+                state,
+                authoring.expandBeamSpec,
+                spec
+            )
+            if expanded == nil then
+                return nil, err, detail
+            end
+            return callBroker(
+                state,
+                "upsert",
+                local_beam_id,
+                expanded
+            )
         end
-        facade.replaceSegments = function(_, ...)
-            return callBroker(state, "replaceSegments", ...)
+        facade.emit = function(_, spec)
+            local expanded, err, detail = expandForFacade(
+                state,
+                authoring.expandEmitSpec,
+                spec
+            )
+            if expanded == nil then
+                return nil, err, detail
+            end
+            for _ = 1, constants.MAX_BEAMS_PER_PRODUCER + 1 do
+                local serial = nextInteger(state.nextEmitSerial)
+                if serial == nil then
+                    return nil, "provider_reset"
+                end
+                state.nextEmitSerial = serial
+                local generated_id = string.format(
+                    "@beamfx/emit/%d/%d",
+                    state.producerGeneration,
+                    serial
+                )
+                local result
+                result, err, detail = callBroker(
+                    state,
+                    "emit",
+                    generated_id,
+                    expanded
+                )
+                if result ~= nil then
+                    return result.id
+                end
+                if err ~= "beam_id_in_use" then
+                    return nil, err, detail
+                end
+            end
+            return nil, "provider_reset", {
+                path = "",
+                reason = "generated_id_exhausted",
+                message = "BeamFX could not allocate a unique emit ID.",
+            }
         end
-        facade.appendSegments = function(_, ...)
-            return callBroker(state, "appendSegments", ...)
+        facade.upsertPath = function(_, local_beam_id, spec)
+            local expanded, err, detail = expandForFacade(
+                state,
+                authoring.expandPathSpec,
+                spec
+            )
+            if expanded == nil then
+                return nil, err, detail
+            end
+            return callBroker(
+                state,
+                "upsert",
+                local_beam_id,
+                expanded
+            )
+        end
+        facade.replaceSegments = function(
+            _,
+            local_beam_id,
+            segments,
+            options
+        )
+            local expanded, err, detail = expandForFacade(
+                state,
+                authoring.expandSegmentList,
+                segments,
+                "segments"
+            )
+            if expanded == nil then
+                return nil, err, detail
+            end
+            return callBroker(
+                state,
+                "replaceSegments",
+                local_beam_id,
+                expanded,
+                options
+            )
+        end
+        facade.appendSegments = function(
+            _,
+            local_beam_id,
+            segments,
+            options
+        )
+            local expanded, err, detail = expandForFacade(
+                state,
+                authoring.expandSegmentList,
+                segments,
+                "segments"
+            )
+            if expanded == nil then
+                return nil, err, detail
+            end
+            return callBroker(
+                state,
+                "appendSegments",
+                local_beam_id,
+                expanded,
+                options
+            )
         end
         facade.renew = function(_, ...)
             return callBroker(state, "renew", ...)
@@ -271,9 +401,10 @@ function producer_registry.new(options)
             return callBroker(state, "clear", ...)
         end
         facade.release = function(_, ...)
-            local result, err = callBroker(state, "release", ...)
+            local result, err, detail =
+                callBroker(state, "release", ...)
             if result == nil then
-                return nil, err
+                return nil, err, detail
             end
             diagnostics.releasedProducers =
                 diagnostics.releasedProducers + 1
@@ -342,6 +473,7 @@ function producer_registry.new(options)
             segmentCount = 0,
             boundaryInvalidRequests = 0,
             staleProducerRequests = 0,
+            nextEmitSerial = 0,
             live = true,
         }
         local facade, facade_err = makeFacade(state)

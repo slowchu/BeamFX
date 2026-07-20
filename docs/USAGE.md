@@ -11,7 +11,7 @@ path is:
 3. register a producer;
 4. publish a beam.
 
-The examples below target OpenMW `0.51` and BeamFX public API `1.0`.
+The examples below target OpenMW `0.51` and BeamFX public API `1.3`.
 
 If this is your first integration, complete sections 1–3 first. Sections 4–5
 explain how to adapt that first beam. Everything after that is a recipe or
@@ -81,8 +81,8 @@ In OpenMW `0.51`, you can instead enable the same switch through
 **Launcher → Settings → Visuals → Post Processing** or
 **Options → Video → Post Processing** in game.
 
-Do not add `beamfx_core.omwfx` to the F2 postprocessing chain. BeamFX loads and
-controls that shader dynamically.
+Do not add `beamfx_core_v3.omwfx` to the F2 postprocessing chain. BeamFX loads
+and controls that shader dynamically.
 
 Restart OpenMW completely after changing data roots or script manifests. The
 in-game postprocessing switch applies immediately.
@@ -100,192 +100,162 @@ Player, local, and custom scripts should not call BeamFX directly. They send a
 namespaced event to their own global adapter; the adapter validates
 current game state, derives the space key, and publishes the visual.
 
+For a production-ready starting point, copy the ordinary-Lua
+[`examples/consumer_adapter`](../examples/consumer_adapter) template. It
+already handles lazy registration, provider resets, retry throttling,
+rate-limited warnings, reconstruction, events, and cleanup. It has no Cod3x or
+LuaLS-stub dependency.
+
 ## 3. Quick start: draw one beam
 
-The following complete global script draws a blue electric beam in front of
-the first player. It checks twice per simulation second until both the player
-and BeamFX are ready.
-
-Before copying it, replace:
-
-- `author.modname.quickstart` with your own stable, namespaced producer ID;
-- `My Mod` with your mod's display name.
-
-A producer ID may contain ASCII letters, digits, `.`, `_`, and `-`, and its
-first character must be alphanumeric.
-
-Copy the script to the global-script path from your manifest:
+Once your global adapter has a registered `producer`, the whole effect call is:
 
 ```lua
-local core = require("openmw.core")
+local beamId, err, detail = producer:emit({
+    cell = player.cell,
+    from = startPos,
+    to = endPos,
+    preset = "frost",
+    radius = 6,
+    duration = 0.25,
+})
+```
+
+That call:
+
+- converts `player.cell` to a string space key immediately;
+- generates an opaque local beam ID that cannot overwrite one of your beams;
+- builds one segment from `from` to `to`;
+- uses a transient `0.25`-second lifetime and `0.10`-second fade unless you
+  override them;
+- expands the friendly `frost` preset into ordinary segment fields.
+
+Most one-shot effects do not need to save `beamId`. If you do retain it, treat
+it as an opaque string.
+
+### Minimal complete test script
+
+This small global script places a frost beam in front of the first player. It
+is intended to get a first result; use the supplied consumer adapter template
+for production reset, retry, event, and cleanup behavior.
+
+Replace the producer ID and display name before using it:
+
+```lua
 local I = require("openmw.interfaces")
 local world = require("openmw.world")
 
-local producer = nil
+local producer
 local finished = false
-local nextAttemptAt = 0
-local producerIdWarningShown = false
 
 local function reset()
     producer = nil
     finished = false
-    nextAttemptAt = 0
-    producerIdWarningShown = false
 end
 
-local function firstPlayer()
-    local players = world.players
-    if players == nil then
-        return nil
-    end
-    local ok, player = pcall(function()
-        return players[1]
-    end)
-    return ok and player or nil
-end
-
-local function acquireProducer(api)
-    if producer ~= nil then
-        return producer
-    end
-
-    local newProducer, err = api.registerProducer({
-        id = "author.modname.quickstart",
-        displayName = "My Mod",
-        apiMajor = 1,
-    })
-    if newProducer ~= nil then
-        producer = newProducer
-        producerIdWarningShown = false
-    elseif err == "producer_id_in_use" then
-        if not producerIdWarningShown then
-            print(
-                "[My Mod] BeamFX producer ID is busy; retrying. "
-                    .. "If this persists, choose a unique ID."
-            )
-            producerIdWarningShown = true
-        end
-    elseif err ~= "provider_reset" then
-        print("[My Mod] BeamFX registration failed: " .. tostring(err))
-        finished = true
-    end
-    return producer
-end
-
-local function tryFirstBeam()
+local function onUpdate()
     if finished then
         return
     end
 
-    local now = core.getSimulationTime()
-    if now < nextAttemptAt then
-        return
-    end
-    nextAttemptAt = now + 0.5
-
     local api = I.BeamFX
-    if api == nil or api.apiMajor ~= 1 then
+    local player = world.players[1]
+    if api == nil
+        or api.apiMajor ~= 1
+        or api.apiMinor < 3
+        or player == nil
+        or player.cell == nil
+    then
         return
     end
 
-    local handle = acquireProducer(api)
-    local player = firstPlayer()
-    if handle == nil or player == nil or player.cell == nil then
-        return
-    end
-
-    local spaceKey = api.spaceKeyForCell(player.cell)
-    if type(spaceKey) ~= "string" then
-        return
+    if producer == nil then
+        producer = api.registerProducer({
+            id = "author.modname.quickstart",
+            displayName = "My Mod",
+            apiMajor = 1,
+            apiMinor = 3,
+        })
+        if producer == nil then
+            return
+        end
     end
 
     local yaw = player.rotation:getYaw()
     local forwardX = math.sin(yaw)
     local forwardY = math.cos(yaw)
     local position = player.position
-
-    local result, err = handle:upsert("welcome_beam", {
-        spaceKey = spaceKey,
-        lifecycle = {
-            mode = "transient",
-            duration = 8.0,
-            fadeDuration = 0.5,
+    local beamId, err, detail = producer:emit({
+        cell = player.cell,
+        from = {
+            x = position.x + forwardX * 100,
+            y = position.y + forwardY * 100,
+            z = position.z + 110,
         },
-        maxSegments = 1,
-        segments = {
-            {
-                startPos = {
-                    x = position.x + forwardX * 100,
-                    y = position.y + forwardY * 100,
-                    z = position.z + 110,
-                },
-                endPos = {
-                    x = position.x + forwardX * 800,
-                    y = position.y + forwardY * 800,
-                    z = position.z + 110,
-                },
-                radius = 8,
-                outerColor = { 0.05, 0.35, 1.0 },
-                coreColor = { 0.80, 0.94, 1.0 },
-                coreRatio = 0.24,
-                intensity = 2.0,
-                style = "electric",
-                styleScale = 14,
-                seed = 7,
-            },
+        to = {
+            x = position.x + forwardX * 800,
+            y = position.y + forwardY * 800,
+            z = position.z + 110,
         },
+        preset = "frost",
+        radius = 8,
+        duration = 8,
+        fadeDuration = 0.5,
     })
 
-    if result ~= nil then
+    if beamId ~= nil then
         finished = true
         print("[My Mod] BeamFX quick-start beam published")
     elseif err == "stale_producer" or err == "provider_reset" then
         producer = nil
     else
         finished = true
-        print("[My Mod] BeamFX publish failed: " .. tostring(err))
+        print(
+            "[My Mod] BeamFX failed at "
+                .. tostring(detail and detail.path or "?")
+                .. ": " .. tostring(detail and detail.message or err)
+        )
     end
 end
 
 return {
     engineHandlers = {
-        onUpdate = tryFirstBeam,
+        onUpdate = onUpdate,
         onLoad = reset,
         onNewGame = reset,
     },
 }
 ```
 
-What should happen:
-
-- within half a simulation second of both systems becoming ready, a blue
-  electric beam appears in front of the player;
-- it remains for eight simulation-time seconds and fades during the last
-  `0.5` seconds;
-- the log contains `[My Mod] BeamFX quick-start beam published`;
-- if BeamFX is missing, the script quietly waits and the rest of your mod can
-  continue.
-
-Reload a save or start a new game to run the one-time example again. If it
-reports success but nothing is visible, go directly to
+The beam should appear within an update after both the player and BeamFX are
+ready, remain for eight simulation-time seconds, and fade over its last half
+second. If it reports success but nothing is visible, go directly to
 [troubleshooting](#16-troubleshooting).
-
-This first-result script deliberately stays small. Before shipping, add the
-provider-session recovery pattern in
-[section 10](#10-recovering-after-a-provider-reset).
 
 ## 4. Understanding the first beam
 
 The important call is:
 
 ```lua
-producer:upsert(localBeamId, beamSpec)
+producer:emit(effectSpec)
 ```
 
-`localBeamId` belongs only to your producer. Another mod may use the same
-local ID without colliding with you.
+`emit` is for short-lived one-shot visuals. It returns a generated local beam
+ID on success. For a beam whose ID or lifecycle you want to manage yourself,
+use `producer:upsert(localBeamId, beamSpec)`. A manual `localBeamId` belongs
+only to your producer, so another mod may use the same local ID without
+colliding with you.
 
-The beam specification answers four questions:
+An `emit` specification answers four questions:
+
+| Question | Field |
+|---|---|
+| Where may it render? | `cell` or `spaceKey` |
+| What line should it draw? | `from` and `to`, or `points` |
+| How long does it live? | `duration` and `fadeDuration` |
+| What should it look like? | `preset`, `color`, and appearance overrides |
+
+The expanded advanced beam specification answers the same questions with:
 
 | Question | Field |
 |---|---|
@@ -297,17 +267,21 @@ The beam specification answers four questions:
 See [styles and friendly starter values](#11-styles-and-friendly-starter-values)
 when you are ready to change the look.
 
-Every mutation returns `result, err`. On success, `result` is a table and
-`err` is `nil`. On failure, `result` is
-`nil` and `err` is a stable string such as `invalid_spec`.
+Most mutations return `result, err, detail`; `emit` returns
+`beamId, err, detail`. On success, `err` and `detail` are `nil`. On failure,
+the first value is `nil`, `err` is a stable string such as `invalid_spec`, and
+`detail` may identify the exact field and explain it. Existing code may ignore
+the optional third return.
 
 ## 5. Which producer method should I use?
 
 | Goal | Method |
 |---|---|
-| Create a beam or replace its full specification | `upsert` |
-| Move or reshape an existing beam | `replaceSegments` |
-| Add points to a bounded rolling trail | `appendSegments` |
+| Draw a short-lived one-shot segment or path with generated ID and defaults | `emit` |
+| Create or replace a connected path and compute pattern offsets | `upsertPath` |
+| Create a beam or replace its full specification; restart its pattern clock | `upsert` |
+| Move or reshape an existing beam; preserve its pattern clock | `replaceSegments` |
+| Add points to a bounded rolling trail; preserve its pattern clock | `appendSegments` |
 | Keep a leased persistent visual alive without resending geometry | `renew` |
 | End with a hold/fade | `finish` |
 | Remove one beam immediately | `remove` |
@@ -335,6 +309,124 @@ They also use position names such as `from`, `to`, `firstPoint`, and
 `{ x = 10, y = 20, z = 30 }`.
 
 ### One-shot or projectile beam
+
+Use `emit` when the visual should expire on its own:
+
+```lua
+local beamId, err, detail = producer:emit({
+    spaceKey = spaceKey,
+    from = from,
+    to = to,
+    preset = "laser",
+    color = { 1.0, 0.10, 0.05 },
+    radius = 6,
+    intensity = 1.8,
+    duration = 0.25,
+})
+```
+
+You can supply a current global-context `cell` instead of `spaceKey`. Do not
+send that Cell through a cross-context event; let your global adapter read the
+current Cell and call `emit`.
+
+Use `points` instead of `from`/`to` for a connected transient path:
+
+```lua
+producer:emit({
+    cell = player.cell,
+    points = { firstPoint, bendPoint, lastPoint },
+    preset = "lightning",
+    duration = 0.3,
+})
+```
+
+BeamFX automatically creates the two segments and assigns cumulative
+`longitudinal.pathOffset` values.
+
+### Presets, color, and overrides
+
+The six built-in appearance presets are:
+
+| Preset | Starting character |
+|---|---|
+| `frost` | pale blue, smooth, softer fog-aware glow |
+| `fire` | orange plasma |
+| `lightning` | blue electric energy |
+| `laser` | narrow red smooth beam |
+| `fishing_line` | thin, join-safe, mostly non-emissive filament |
+| `energy_blade` | bright blue smooth blade |
+
+Presets are collections of existing appearance values, not new shader styles.
+Override any field normally:
+
+```lua
+producer:emit({
+    spaceKey = spaceKey,
+    from = from,
+    to = to,
+    preset = "frost",
+    color = { 0.30, 0.85, 1.0 },
+    radius = 10,
+    intensity = 1.8,
+})
+```
+
+`color` derives `outerColor`, a brighter `coreColor`, and a darker
+`baseColor`. If you also supply any of those three explicit fields, the
+explicit field wins. The full precedence is:
+
+```text
+preset < segmentDefaults < individual segment
+color-derived channel < explicit channel in the same layer
+```
+
+### Connected path with a stable ID
+
+Use `upsertPath` for a path you will update, finish, or remove by name:
+
+```lua
+producer:upsertPath("fishing_line", {
+    cell = player.cell,
+    points = {
+        rodTip,
+        sagPoint1,
+        sagPoint2,
+        bobber,
+    },
+    preset = "fishing_line",
+})
+```
+
+The default lifecycle is persistent. Supply `duration` and `fadeDuration`, or
+a full `lifecycle`, when it should be transient. Every call replaces the
+complete named path and restarts its lifecycle and longitudinal animation
+clock, just like `upsert`.
+
+For a full advanced `upsert`, `segmentDefaults` avoids repeating shared
+appearance:
+
+```lua
+producer:upsert("arc", {
+    spaceKey = spaceKey,
+    lifecycle = { mode = "transient", duration = 0.3 },
+    segmentDefaults = {
+        preset = "lightning",
+        radius = 5,
+        intensity = 1.5,
+    },
+    segments = {
+        { startPos = a, endPos = b },
+        { startPos = b, endPos = c, radius = 7 },
+        { startPos = c, endPos = d },
+    },
+})
+```
+
+The middle segment uses radius `7`; the others inherit radius `5`. The
+friendly fields are expanded before validation and are never stored or sent
+to the renderer.
+
+### Advanced one-shot with a manual ID
 
 Use a transient lifecycle. Use a unique local ID when shots may overlap:
 
@@ -371,8 +463,9 @@ local result, err = producer:upsert(id, {
 ```
 
 Reusing an active ID with `upsert` replaces the full beam and restarts its
-lifecycle. That is useful for a single repeatedly replaced effect, but not for
-overlapping shots.
+lifecycle and longitudinal pattern animation. That is useful for a single
+repeatedly replaced effect, but not for overlapping shots or a moving pattern
+whose phase should remain continuous.
 
 ### Continuous beam
 
@@ -418,6 +511,9 @@ local result, err = producer:replaceSegments("continuous_link", {
 })
 ```
 
+`replaceSegments` preserves the beam's lifecycle and longitudinal animation
+clock. Prefer it over repeated `upsert` calls when a continuous beam moves.
+
 When the effect ends, fade it once:
 
 ```lua
@@ -429,6 +525,256 @@ producer:finish("continuous_link", {
 
 Repeated `finish` calls on the same finishing generation are idempotent and
 do not extend the fade.
+
+### Tapered beam
+
+`radius` is the fallback width for older integrations. Add `startRadius` and
+`endRadius` when you want different widths at the two endpoints:
+
+```lua
+producer:upsert("tapered_bolt", {
+    spaceKey = spaceKey,
+    lifecycle = {
+        mode = "transient",
+        duration = 0.30,
+        fadeDuration = 0.12,
+    },
+    maxSegments = 1,
+    segments = {
+        {
+            startPos = from,
+            endPos = to,
+            radius = 6,       -- fallback if either endpoint field is omitted
+            startRadius = 8,
+            endRadius = 0,    -- exact zero makes a pointed tip
+            style = "smooth",
+            outerColor = { 0.10, 0.55, 1.00 },
+            coreColor = { 0.85, 0.96, 1.00 },
+            intensity = 1.7,
+        },
+    },
+})
+```
+
+An endpoint radius of exactly `0` is allowed. Other positive values use the
+style's normal minimum. Taper changes only the drawing; your Lua raycast or
+other gameplay test remains whatever your mod implements.
+
+### Thin connected line or curve
+
+BeamFX segments are straight. Approximate a controlled curve by calculating
+points in your mod and joining each adjacent pair with `filament` segments.
+This three-piece example assumes `point1` through `point4` are world positions:
+
+```lua
+producer:upsert("curved_line", {
+    spaceKey = spaceKey,
+    lifecycle = { mode = "persistent" },
+    maxSegments = 3,
+    segments = {
+        {
+            startPos = point1,
+            endPos = point2,
+            radius = 0.10,
+            minPixelWidth = 0.85,
+            style = "filament",
+            outerColor = { 0.35, 0.45, 0.55 },
+            coreColor = { 0.80, 0.90, 1.00 },
+            coreRatio = 0.30,
+            intensity = 0.35,
+        },
+        {
+            startPos = point2,
+            endPos = point3,
+            radius = 0.10,
+            minPixelWidth = 0.85,
+            style = "filament",
+            outerColor = { 0.35, 0.45, 0.55 },
+            coreColor = { 0.80, 0.90, 1.00 },
+            coreRatio = 0.30,
+            intensity = 0.35,
+        },
+        {
+            startPos = point3,
+            endPos = point4,
+            radius = 0.10,
+            minPixelWidth = 0.85,
+            style = "filament",
+            outerColor = { 0.35, 0.45, 0.55 },
+            coreColor = { 0.80, 0.90, 1.00 },
+            coreRatio = 0.30,
+            intensity = 0.35,
+        },
+    },
+})
+```
+
+Update the calculated points with `replaceSegments` when the curve changes.
+`filament` has no flicker and uses max composition between overlapping
+filament and trail segments, preventing additive bright spots at connected
+joints.
+
+`radius` is world-space thickness. `minPixelWidth` is an optional minimum full
+body width on screen, excluding glow, so a very thin filament remains legible
+at a distance. A positive pixel floor is valid only for `filament` and does not
+make any gameplay hitbox larger.
+
+### Dark fishing line, wire, or tether
+
+Set emitted intensity to zero and give the segment a base material:
+
+```lua
+producer:upsert("fishing_line", {
+    spaceKey = spaceKey,
+    lifecycle = { mode = "persistent" },
+    maxSegments = 1,
+    segments = {
+        {
+            startPos = rodTip,
+            endPos = lure,
+            radius = 0.10,
+            minPixelWidth = 0.75,
+            style = "filament",
+
+            intensity = 0,
+            baseColor = { 0.05, 0.07, 0.08 },
+            baseOpacity = 0.70,
+
+            depthSoftness = 0.75,
+            fogInfluence = 1,
+        },
+    },
+})
+```
+
+`baseColor` and `baseOpacity` are separate from the glowing `outerColor`,
+`coreColor`, `intensity`, and `opacity`. This can draw a dark or non-emissive
+line, but it is still a postprocessed visual rather than a normally lit 3D
+rope. Use your own mesh when lighting, shadows, or physical volume matter.
+
+### Fade into endpoints and scene geometry
+
+These fields may be added to any segment:
+
+```lua
+startFadeLength = 4, -- fade in over the first 4 world units
+endFadeLength = 8,   -- fade out over the last 8 world units
+depthSoftness = 2,   -- soften contact with opaque scene depth
+fogInfluence = 1,    -- fully follow the scene's fog amount
+```
+
+The start/end lengths are spatial fades, not seconds. They are independent of
+the time-based `fadeDuration` used by beam and segment lifecycles.
+`depthSoftness = 0` keeps a hard depth intersection; larger values blend over
+more world-space distance. `fogInfluence` ranges from `0` for the legacy
+no-added-fog response to `1` for the full scene fog response.
+
+### Traveling, pulsing, and dashed patterns
+
+Add one `longitudinal` table to a segment. These examples can be copied into
+any segment shown above.
+
+A single moving packet:
+
+```lua
+longitudinal = {
+    mode = "travel",
+    visibleLength = 30,
+    speed = 120,          -- positive moves from startPos toward endPos
+    headFadeLength = 4,
+    tailFadeLength = 8,
+    loop = true,
+    loopLength = 100,
+    loopDelay = 0.25,
+}
+```
+
+For looping travel across several connected segments, use cumulative
+`pathOffset` values and set the same `loopLength`—the total path length—on
+every segment. Negative looping travel then moves through decreasing offsets.
+For non-loop negative travel, use one segment or reverse your point order and
+offset convention.
+
+Repeating bright pulses over a dim continuous carrier:
+
+```lua
+longitudinal = {
+    mode = "pulse",
+    period = 40,
+    pulseLength = 12,
+    speed = 80,
+    carrierLevel = 0.20,
+    fadeLength = 2,
+}
+```
+
+Static or moving dashes:
+
+```lua
+longitudinal = {
+    mode = "dash",
+    dashLength = 18,
+    gapLength = 10,
+    speed = 0, -- change to a positive or negative value to animate
+    fadeLength = 1,
+}
+```
+
+Omitting `longitudinal` uses `solid`, which draws the whole segment. These
+patterns mask only the visual. A traveling bright section is not a moving
+damage volume; Lua still performs targeting, raycasts, and damage.
+
+For a pattern to continue cleanly across connected segments, give each segment
+the cumulative length of the preceding path as `pathOffset`:
+
+```lua
+local function distance(a, b)
+    local x = b.x - a.x
+    local y = b.y - a.y
+    local z = b.z - a.z
+    return math.sqrt(x * x + y * y + z * z)
+end
+
+local points = { point1, point2, point3, point4 }
+local segments = {}
+local offset = 0
+
+for index = 1, #points - 1 do
+    local fromPoint = points[index]
+    local toPoint = points[index + 1]
+    segments[#segments + 1] = {
+        startPos = fromPoint,
+        endPos = toPoint,
+        radius = 0.15,
+        minPixelWidth = 1,
+        style = "filament",
+        outerColor = { 0.15, 0.60, 1.00 },
+        coreColor = { 0.90, 0.98, 1.00 },
+        intensity = 1.2,
+        longitudinal = {
+            mode = "dash",
+            pathOffset = offset,
+            dashLength = 10,
+            gapLength = 6,
+            speed = 24,
+            fadeLength = 1,
+        },
+    }
+    offset = offset + distance(fromPoint, toPoint)
+end
+
+producer:upsert("connected_dashes", {
+    spaceKey = spaceKey,
+    lifecycle = { mode = "persistent" },
+    maxSegments = #segments,
+    segments = segments,
+})
+```
+
+The animation clock belongs to the beam generation. `upsert` restarts it.
+`replaceSegments`, `appendSegments`, `renew`, and `finish` preserve it. Use
+`replaceSegments` for moving endpoints when you want a pulse or dash to keep
+its phase instead of jumping back to the start.
 
 ### Rolling trail
 
@@ -826,7 +1172,8 @@ All style names are lowercase.
 | `smooth` | `4..8` | `0` | clean laser or link |
 | `electric` | `6..10` | `8..18` | animated jagged energy |
 | `plasma` | `7..14` | `6..18` | noisy bright energy |
-| `trail` | `3..7` | `0` | best with segment timing |
+| `trail` | `3..7` | `0` | join-safe; best with segment timing |
+| `filament` | `0.10..2` | `0` | join-safe thin lines; try `minPixelWidth = 0.75` |
 
 Useful general starting values:
 
@@ -844,11 +1191,34 @@ outerColor = { 0.05, 0.35, 1.0 }
 coreColor = { 0.80, 0.94, 1.0 }
 ```
 
+For a non-emissive base, keep `baseColor` components in `0..1`:
+
+```lua
+intensity = 0
+baseColor = { 0.05, 0.07, 0.08 }
+baseOpacity = 0.70
+```
+
+Useful optional polish ranges:
+
+| Goal | Starter field |
+|---|---|
+| Pointed end | `endRadius = 0` |
+| Readable fine filament | `minPixelWidth = 0.75` |
+| Soft wall contact | `depthSoftness = 1..4` |
+| Normal outdoor fog response | `fogInfluence = 1` |
+| Fade into an endpoint | `startFadeLength = 2..8` or `endFadeLength = 2..8` |
+
 Plasma has two extra rules:
 
 - an ordinary plasma segment uses seed `1..15`;
 - a plasma origin-glow segment uses `originGlow = true` and effective seed
   `0`.
+
+`trail` and `filament` are non-flickering and use max instead of additive
+composition with each other. Joints and self-crossings therefore do not become
+brighter, but separate trail or filament effects also do not add brightness
+where they overlap.
 
 Consumers cannot supply GLSL, shader filenames, uniforms, packed metadata, or
 custom shader styles.
@@ -877,9 +1247,15 @@ One producer can never clear or remove another producer's effects.
 
 ## 13. Capacity guidance
 
-The shader can display 64 segments and 16 palettes per frame. Logical state
-has larger bounded quotas, but publishing unnecessary geometry still costs
-validation, storage, routing, and scheduling work.
+The shader can display 64 segments and 16 combined appearance/feature profiles
+per frame. Logical state has larger bounded quotas, but publishing unnecessary
+geometry still costs validation, storage, routing, and scheduling work.
+
+If more than 16 selected segments need distinct profiles, BeamFX may reuse the
+nearest compatible profile. It never approximates across a longitudinal mode
+or turns an opt-in feature on or off. If more than 16 incompatible feature
+classes are selected at once, excess incompatible segments fail closed
+visually; gameplay remains unaffected.
 
 Good producer behavior:
 
@@ -896,6 +1272,33 @@ Priority is only an ordering hint within your producer. It cannot starve
 another producer.
 
 ## 14. Handling errors
+
+API 1.3 may return an actionable third value:
+
+```lua
+local result, err, detail = producer:upsert("arc", beamSpec)
+if result == nil then
+    print(
+        tostring(detail and detail.path or "?")
+            .. ": " .. tostring(detail and detail.message or err)
+    )
+end
+```
+
+For example, a positive filament pixel floor on the second smooth segment
+returns:
+
+```lua
+nil, "invalid_spec", {
+    path = "segments[2].minPixelWidth",
+    reason = "requires_filament",
+    message = "minPixelWidth is only supported by the filament style.",
+}
+```
+
+`path` points at the authoring field, `reason` is a stable machine-readable
+identifier, and `message` is intended for a person. The detail is optional:
+older `local result, err = ...` code remains valid.
 
 ### Usually retry after reacquiring
 
@@ -948,6 +1351,10 @@ local stats = producer and producer:stats()
 Useful checks:
 
 - `capabilities.styles` — available built-in styles;
+- `capabilities.presets` — available friendly appearance presets;
+- `capabilities.producerMethods` — exact methods on this producer facade;
+- `capabilities.convenienceMethods` — friendly helpers such as `emit` and
+  `upsertPath`;
 - `capabilities.quotas` — current public bounds;
 - `diagnostics.current.registeredProducers` — live producer count;
 - `stats.activeBeams` and `stats.retainedSegments` — your current state.
@@ -992,7 +1399,12 @@ gameplay error.
 - Confirm the transient duration is long enough to survive your update and
   render cadence.
 - Check `I.BeamFXRenderer.status()` from player-local context.
-- Check that `opacity`, `intensity`, and `radius` are not effectively zero.
+- Check that at least one endpoint radius is positive, or that a filament has a
+  positive `minPixelWidth`.
+- Check that either emitted `opacity` and `intensity`, or `baseOpacity`, is
+  visibly positive.
+- For `travel`, confirm the moving window has reached this segment. For
+  `pulse` or `dash`, temporarily use `longitudinal = false` to test solid mode.
 
 ### A continuous beam disappears after load
 
@@ -1020,6 +1432,7 @@ Before shipping a BeamFX integration:
 - [ ] The producer ID is unique, stable, and namespaced.
 - [ ] The global adapter checks API major `1`.
 - [ ] Missing BeamFX affects visuals only.
+- [ ] Lua owns all raycasts, hit tests, targeting, and damage.
 - [ ] Warnings are rate-limited.
 - [ ] The producer handle and provider session are cached together.
 - [ ] `stale_producer` and `provider_reset` trigger reacquisition.
@@ -1027,6 +1440,8 @@ Before shipping a BeamFX integration:
 - [ ] Raw Cells and producer handles never cross events.
 - [ ] Space transitions use remove plus a new generation.
 - [ ] Geometry updates are bounded and sent only when dirty.
+- [ ] Connected patterned segments use `upsertPath` or correct cumulative
+  `pathOffset` values.
 - [ ] Trails use a bounded `maxSegments`.
 - [ ] Every owned effect has a finish, remove, clear, or release path.
 - [ ] The integration has been tested with postprocessing unavailable.
@@ -1034,6 +1449,8 @@ Before shipping a BeamFX integration:
 ## Where to go next
 
 - [API reference](API.md) — exact fields, ranges, returns, quotas, and errors.
-- [Architecture](ARCHITECTURE.md) — provider, broker, routing, and renderer
-  internals.
+- [Consumer adapter](../examples/consumer_adapter) — copyable ordinary-Lua
+  integration plumbing.
+- [Interactive gallery](../examples/visual_gallery) — tune an effect in game
+  and print the corresponding Lua.
 - [README](../README.md) — installation and package overview.
