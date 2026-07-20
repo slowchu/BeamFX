@@ -1,4 +1,0 @@
-# Optional BeamFX visual-gallery developer tool
-MENU: scripts/beamfx_visual_gallery/menu.lua
-GLOBAL: scripts/beamfx_visual_gallery/global.lua
-PLAYER: scripts/beamfx_visual_gallery/player.lua
