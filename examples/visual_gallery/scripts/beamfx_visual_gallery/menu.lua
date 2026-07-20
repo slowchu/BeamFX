@@ -126,13 +126,13 @@ local function registerAll()
     safe("trigger registration", function()
         registerTrigger(
             shared.TRIGGER_TOGGLE,
-            "ToggleActionName",
-            "ToggleActionDescription"
+            "InputBindingDisplayName",
+            "InputBindingDisplayDescription"
         )
         registerTrigger(
             shared.TRIGGER_REPOSITION,
-            "RepositionActionName",
-            "RepositionActionDescription"
+            "InputBindingDisplayName",
+            "InputBindingDisplayDescription"
         )
     end)
     safe("settings registration", registerSettings)

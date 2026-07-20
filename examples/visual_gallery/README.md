@@ -12,16 +12,38 @@ beamfx_visual_gallery.omwscripts
 
 OpenMW's profile-wide **Post Processing** setting must be enabled.
 
-The gallery opens automatically and places a connected preview path in front
-of the player. If scenery blocks it, use **Reposition** in the panel or press
-the configurable reposition binding (F7 by default). The configurable F8
-binding closes and clears the gallery or opens it again. Both bindings appear
-under **Options > Scripts > BeamFX Visual Gallery**.
+The gallery opens automatically, immediately enters an interactive UI mode,
+and places a connected preview path in front of the player. The cursor is
+available without first opening the inventory or main menu, while the game
+and animated preview remain unpaused. If scenery blocks the preview, use
+**Reposition** in the panel or press the configurable reposition binding (F7
+by default), including while the panel is hidden. The configurable F8 binding
+hides or reopens the panel. **Escape** and the panel's **Hide** button also
+hide it. Hiding releases the cursor and interactive UI mode but deliberately
+leaves the world preview visible and animating; reopening preserves its
+position, appearance values, and animation state. Both configurable bindings
+appear under **Options > Scripts > BeamFX Visual Gallery**.
+
+The panel sizes itself to the current UI viewport, including OpenMW GUI-scale
+and resolution changes, and stays clamped on screen. Drag its header to move
+it. The copy-ready recipe is shown in a bounded, read-only field that wraps
+long Lua input instead of drawing outside the panel.
+
+Because BeamFX animation follows simulation time, this developer gallery keeps
+the game running while its cursor is active. Use it from a safe test location.
+The normal Interface pause behavior is restored whenever the panel is hidden.
 
 ## Controls
 
 - Select a property with the upper `<` and `>` controls.
 - Change its value with the lower `-` and `+` controls.
+- Drag the panel header to move the gallery within the visible UI viewport.
+- Press **F7** (default binding) to place the preview in front of the player,
+  even while the panel is hidden.
+- Press **F8** (default binding) to hide or reopen the panel. **Escape** and
+  **Hide** hide it too; none of these clear the world preview.
+- Use **Clear** to remove the world preview separately. That button then
+  becomes **Preview**, which recreates it using the current appearance values.
 - Cycle presets, styles, radius, intensity, both spatial fades, taper,
   longitudinal modes, and filament minimum pixel width.
 - Setting a positive pixel width automatically selects `filament`; selecting
@@ -30,10 +52,11 @@ under **Options > Scripts > BeamFX Visual Gallery**.
   nonzero speed while paused because API 1.3 deliberately rejects a
   zero-speed traveling window.
 - **Reset** restores the initial frost recipe and animation phase.
-- **Show expanded** switches from concise public input to the deterministic
+- **Expanded** switches from concise public input to the deterministic
   canonical appearance represented by the documented preset values.
-- **Print** writes both copy-ready forms to `openmw.log`.
-- **Close + clear** removes all visuals owned by the gallery producer.
+- **Print** writes both copy-ready forms to `openmw.log`; the wrapped recipe
+  field itself is deliberately read-only.
+- Hiding the panel does not reset its location or current recipe.
 
 The UI shows structured validation details from BeamFX, including the failing
 field path and stable reason when the provider supplies them.
@@ -50,7 +73,7 @@ reference to its global adapter. The global script:
 - owns the producer facade and preview geometry;
 - notices provider-epoch and Cell changes;
 - republishes through `producer:upsertPath`;
-- clears its producer on close, load, or new game.
+- clears its producer when **Clear** is selected, or on load or new game.
 
 No BeamFX implementation module, private render event, shader uniform, LuaLS
 stub, or Cod3x feature is used.
