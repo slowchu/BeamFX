@@ -1,0 +1,898 @@
+uniform_int bfxSegmentCount {
+    default = 0;
+    min = 0;
+    max = 64;
+    static = false;
+}
+
+uniform_vec4 bfxSegmentStartRadius {
+    size = 64;
+    static = false;
+}
+
+uniform_vec4 bfxSegmentEndMetadata {
+    size = 64;
+    static = false;
+}
+
+uniform_vec4 bfxSegmentFeatureState {
+    size = 16;
+    static = false;
+}
+
+uniform_vec4 bfxPaletteOuterCore {
+    size = 16;
+    static = false;
+}
+
+uniform_vec4 bfxPaletteCoreGeometry {
+    size = 16;
+    static = false;
+}
+
+uniform_vec4 bfxPaletteBaseShape {
+    size = 16;
+    static = false;
+}
+
+uniform_vec4 bfxPaletteLongitudinal {
+    size = 16;
+    static = false;
+}
+
+fragment main {
+    omw_In vec2 omw_TexCoord;
+
+    float wfRaySegmentDistance(
+        vec3 rayDirection,
+        vec3 segmentStart,
+        vec3 segmentEnd,
+        out float rayDistance,
+        out float segmentT,
+        out float segmentLength
+    ) {
+        vec3 segmentVector = segmentEnd - segmentStart;
+        float segmentLengthSquared = dot(segmentVector, segmentVector);
+        if (segmentLengthSquared <= 0.000001) {
+            rayDistance = max(0.0, dot(segmentStart, rayDirection));
+            segmentT = 0.0;
+            segmentLength = 0.0;
+            return length(rayDirection * rayDistance - segmentStart);
+        }
+        segmentLength = sqrt(segmentLengthSquared);
+
+        float raySegmentDot = dot(rayDirection, segmentVector);
+        float startRayDot = dot(segmentStart, rayDirection);
+        float startSegmentDot = dot(segmentStart, segmentVector);
+        float denominator = segmentLengthSquared - raySegmentDot * raySegmentDot;
+        float segmentFraction;
+        if (denominator > 0.000001) {
+            segmentFraction = (startRayDot * raySegmentDot - startSegmentDot) / denominator;
+        } else {
+            segmentFraction = -startSegmentDot / segmentLengthSquared;
+        }
+        segmentFraction = clamp(segmentFraction, 0.0, 1.0);
+
+        vec3 segmentPoint = segmentStart + segmentVector * segmentFraction;
+        rayDistance = dot(segmentPoint, rayDirection);
+        if (rayDistance < 0.0) {
+            rayDistance = 0.0;
+            segmentFraction = clamp(-startSegmentDot / segmentLengthSquared, 0.0, 1.0);
+            segmentPoint = segmentStart + segmentVector * segmentFraction;
+        }
+        segmentT = segmentFraction;
+        return length(rayDirection * rayDistance - segmentPoint);
+    }
+
+    float wfRaySegmentDistance(
+        vec3 rayDirection,
+        vec3 segmentStart,
+        vec3 segmentEnd,
+        out float rayDistance
+    ) {
+        float segmentT = 0.0;
+        float segmentLength = 0.0;
+        return wfRaySegmentDistance(
+            rayDirection,
+            segmentStart,
+            segmentEnd,
+            rayDistance,
+            segmentT,
+            segmentLength
+        );
+    }
+
+    float wfSegmentFeatureState(int index) {
+        vec4 block = bfxSegmentFeatureState[index / 4];
+        return block[index - (index / 4) * 4];
+    }
+
+    float wfDecodeFeatureDistance(uint code) {
+        if (code == 0u) {
+            return 0.0;
+        }
+        const float logarithmicMinimum = -6.64385619;
+        const float logarithmicSpan = 26.57542476;
+        float normalized = float(code - 1u) / 1022.0;
+        return exp2(logarithmicMinimum + logarithmicSpan * normalized);
+    }
+
+    float wfWorldUnitsPerPixel(
+        vec3 rayDirection,
+        float rayDistance
+    ) {
+        vec3 viewRelative = mat3(omw.viewMatrix)
+            * (rayDirection * rayDistance);
+        float viewDepth = abs(viewRelative.z);
+        float projectionScale = abs(omw.projectionMatrix[1][1]);
+        return (2.0 * viewDepth)
+            / max(1.0, projectionScale * omw.resolution.y);
+    }
+
+    float wfSpatialMask(
+        float along,
+        float segmentLength,
+        float startFadeLength,
+        float endFadeLength
+    ) {
+        if (segmentLength <= 0.000001) {
+            return 1.0;
+        }
+        float startMask = startFadeLength > 0.0
+            ? smoothstep(0.0, startFadeLength, along)
+            : 1.0;
+        float endMask = endFadeLength > 0.0
+            ? smoothstep(0.0, endFadeLength, segmentLength - along)
+            : 1.0;
+        return startMask * endMask;
+    }
+
+    float wfWindowMask(
+        float along,
+        float tail,
+        float head,
+        float tailFade,
+        float headFade
+    ) {
+        float afterTail = tailFade > 0.0
+            ? smoothstep(tail, tail + tailFade, along)
+            : step(tail, along);
+        float beforeHead = headFade > 0.0
+            ? 1.0 - smoothstep(head - headFade, head, along)
+            : 1.0 - step(head, along);
+        return afterTail * beforeHead;
+    }
+
+    void wfLongitudinalMasks(
+        int mode,
+        bool reverseTravel,
+        uint phaseCode,
+        vec4 profile,
+        float along,
+        float segmentLength,
+        out float emissiveMask,
+        out float materialMask
+    ) {
+        emissiveMask = 1.0;
+        materialMask = 1.0;
+        if (mode == 0) {
+            return;
+        }
+
+        if (mode == 1) {
+            // Travel reserves zero for not-yet-arrived and the high-bit range
+            // for already-passed/delay states; only the low 15-bit interval
+            // reconstructs a local moving head.
+            if (phaseCode == 0u || phaseCode >= 32768u) {
+                emissiveMask = 0.0;
+                materialMask = 0.0;
+                return;
+            }
+            float orientedAlong = reverseTravel
+                ? segmentLength - along
+                : along;
+            float visibleLength = max(0.0001, profile.z);
+            float head = (float(phaseCode) / 32767.0)
+                * (segmentLength + visibleLength);
+            uint fadePack = uint(max(0.0, profile.w));
+            float headFade = visibleLength
+                * float(fadePack & 4095u) / 4095.0;
+            float tailFade = visibleLength
+                * float((fadePack >> 12u) & 4095u) / 4095.0;
+            float window = wfWindowMask(
+                orientedAlong,
+                head - visibleLength,
+                head,
+                tailFade,
+                headFade
+            );
+            emissiveMask = window;
+            materialMask = window;
+            return;
+        }
+
+        float cycleLength = max(0.0001, profile.z);
+        float phase = float(phaseCode) / 65535.0;
+        float cyclePosition = mod(
+            along + phase * cycleLength,
+            cycleLength
+        );
+        // "packed" is a reserved GLSL layout qualifier on the OpenMW 0.51
+        // compiler. Keep the decoded integer under an ordinary identifier.
+        uint patternPack = uint(max(0.0, profile.w));
+        if (mode == 2) {
+            float pulseLength = cycleLength
+                * float(patternPack & 1023u) / 1023.0;
+            float fadeLength = pulseLength * 0.5
+                * float((patternPack >> 10u) & 127u) / 127.0;
+            float carrier = float((patternPack >> 17u) & 127u) / 127.0;
+            float pulse = wfWindowMask(
+                cyclePosition,
+                0.0,
+                pulseLength,
+                fadeLength,
+                fadeLength
+            );
+            emissiveMask = mix(carrier, 1.0, pulse);
+            materialMask = 1.0;
+            return;
+        }
+
+        float dashLength = cycleLength
+            * float(patternPack & 4095u) / 4095.0;
+        float fadeLength = dashLength * 0.5
+            * float((patternPack >> 12u) & 4095u) / 4095.0;
+        float dash = wfWindowMask(
+            cyclePosition,
+            0.0,
+            dashLength,
+            fadeLength,
+            fadeLength
+        );
+        emissiveMask = dash;
+        materialMask = dash;
+    }
+
+    float wfFogCoverage(vec3 rayDirection, float rayDistance) {
+        float fogDistance = rayDistance;
+        #if OMW_RADIAL_FOG == 0
+            fogDistance = abs(
+                (mat3(omw.viewMatrix) * (rayDirection * rayDistance)).z
+            );
+        #endif
+        return clamp(
+            (fogDistance - omw.fogNear)
+                / max(0.0001, omw.fogFar - omw.fogNear),
+            0.0,
+            1.0
+        );
+    }
+
+    float wfSignedHash(float value) {
+        return fract(sin(value) * 43758.5453123) * 2.0 - 1.0;
+    }
+
+    float wfUnitHash(float value) {
+        return 0.5 + 0.5 * wfSignedHash(value);
+    }
+
+    float wfPlasmaParticleDistance(
+        vec3 rayDirection,
+        vec3 segmentStart,
+        vec3 segmentEnd,
+        float fieldRadius,
+        float spacingHint,
+        float seed,
+        out float rayDistance,
+        out float particleRadius,
+        out float particleKey,
+        out float particleBrightness
+    ) {
+        vec3 segmentVector = segmentEnd - segmentStart;
+        float segmentLength = length(segmentVector);
+        if (segmentLength <= 0.0001) {
+            rayDistance = max(0.0, dot(segmentStart, rayDirection));
+            particleRadius = max(0.9, fieldRadius * 0.18);
+            particleKey = seed;
+            particleBrightness = 1.0;
+            return length(rayDirection * rayDistance - segmentStart);
+        }
+
+        vec3 forward = segmentVector / segmentLength;
+        vec3 referenceAxis = abs(forward.z) < 0.90
+            ? vec3(0.0, 0.0, 1.0)
+            : vec3(0.0, 1.0, 0.0);
+        vec3 right = normalize(cross(forward, referenceAxis));
+        vec3 up = normalize(cross(right, forward));
+        float lineRayDistance = 0.0;
+        wfRaySegmentDistance(
+            rayDirection,
+            segmentStart,
+            segmentEnd,
+            lineRayDistance
+        );
+        float spacing = max(6.0, spacingHint);
+        float along = clamp(
+            dot(rayDirection * lineRayDistance - segmentStart, forward),
+            0.0,
+            segmentLength
+        );
+        // OpenMW 0.51 advances the post-process simulation clock in seconds.
+        float flowTravel = omw.simulationTime * 90.0
+            + seed * spacing * 0.37;
+        float flowCell = floor(flowTravel / spacing);
+        float flowOffset = flowTravel - flowCell * spacing;
+        float nearestCell = floor((along - flowOffset) / spacing + 0.5);
+        float maximumCell = ceil(segmentLength / spacing) + 1.0;
+        float bestNormalizedDistance = 1.0e20;
+        float bestDistance = 1.0e20;
+        float bestRayDistance = 0.0;
+        float bestRadius = max(0.9, fieldRadius * 0.18);
+        float bestKey = seed;
+        float bestBrightness = 1.0;
+        float emitterClearance = max(
+            spacing * 1.10,
+            min(fieldRadius * 1.50, 32.0)
+        );
+
+        // Two deterministic specks in each nearby longitudinal cell imply a
+        // dense particle field without creating particle objects or iterating
+        // over every visible mote.
+        for (int cellOffset = -1; cellOffset <= 1; ++cellOffset) {
+            float cell = nearestCell + float(cellOffset);
+            if (cell < -1.0 || cell > maximumCell) {
+                continue;
+            }
+            for (int layer = 0; layer < 2; ++layer) {
+                // Keeping identity tied to the completed flow cell makes each
+                // mote cross a spacing boundary without changing shape.
+                float identityCell = cell - flowCell;
+                float key = seed * 41.17
+                    + identityCell * 17.83
+                    + float(layer) * 73.31;
+                if (layer == 1 && wfUnitHash(key + 9.71) < 0.52) {
+                    continue;
+                }
+
+                float centerAlong = cell * spacing + flowOffset;
+                if (identityCell != 0.0) {
+                    centerAlong += wfSignedHash(key + 21.43) * spacing * 0.26;
+                }
+                // Leave the physical projectile model unobstructed at the
+                // emitter. View-dependent particle selection in this region
+                // otherwise reads as core flicker while the camera moves.
+                if (centerAlong < emitterClearance) {
+                    continue;
+                }
+                if (centerAlong < 0.0 || centerAlong > segmentLength) {
+                    continue;
+                }
+
+                vec2 lateral = vec2(
+                    wfSignedHash(key + 37.19),
+                    wfSignedHash(key + 61.07)
+                );
+                float lateralLength = length(lateral);
+                if (lateralLength > 1.0) {
+                    lateral /= lateralLength;
+                }
+                float motionPhase = omw.simulationTime * 9.0
+                    + key * 0.31;
+                lateral += vec2(
+                    sin(motionPhase),
+                    sin(motionPhase * 0.73 + 1.91)
+                ) * 0.16;
+                float lateralLimit = fieldRadius * (layer == 0 ? 0.58 : 0.92);
+                vec3 center = segmentStart
+                    + forward * centerAlong
+                    + right * lateral.x * lateralLimit
+                    + up * lateral.y * lateralLimit;
+
+                float sizeMinimum = layer == 0 ? 0.13 : 0.10;
+                float sizeMaximum = layer == 0 ? 0.24 : 0.19;
+                float candidateRadius = max(
+                    0.9,
+                    fieldRadius * mix(
+                        sizeMinimum,
+                        sizeMaximum,
+                        wfUnitHash(key + 87.53)
+                    )
+                );
+                float candidateRayDistance = max(0.0, dot(center, rayDirection));
+                float candidateDistance = length(
+                    rayDirection * candidateRayDistance - center
+                );
+                float normalizedDistance = candidateDistance / candidateRadius;
+                if (normalizedDistance < bestNormalizedDistance) {
+                    bestNormalizedDistance = normalizedDistance;
+                    bestDistance = candidateDistance;
+                    bestRayDistance = candidateRayDistance;
+                    bestRadius = candidateRadius;
+                    bestKey = key;
+                    bestBrightness = mix(
+                        0.78,
+                        1.28,
+                        wfUnitHash(key + 113.29)
+                    );
+                }
+            }
+        }
+
+        rayDistance = bestRayDistance;
+        particleRadius = bestRadius;
+        particleKey = bestKey;
+        particleBrightness = bestBrightness;
+        return bestDistance;
+    }
+
+    float wfElectricDistance(
+        vec3 rayDirection,
+        vec3 segmentStart,
+        vec3 segmentEnd,
+        float displacement,
+        float seed,
+        out float rayDistance
+    ) {
+        vec3 segmentVector = segmentEnd - segmentStart;
+        float segmentLengthSquared = dot(segmentVector, segmentVector);
+        if (segmentLengthSquared <= 0.000001 || displacement <= 0.0001) {
+            return wfRaySegmentDistance(
+                rayDirection,
+                segmentStart,
+                segmentEnd,
+                rayDistance
+            );
+        }
+
+        vec3 forward = segmentVector * inversesqrt(segmentLengthSquared);
+        vec3 referenceAxis = abs(forward.z) < 0.90
+            ? vec3(0.0, 0.0, 1.0)
+            : vec3(0.0, 1.0, 0.0);
+        vec3 right = normalize(cross(forward, referenceAxis));
+        vec3 up = normalize(cross(right, forward));
+        float animationFrame = floor(omw.simulationTime * 12.0);
+        vec3 previousPoint = segmentStart;
+        float bestDistance = 1.0e20;
+        float bestRayDistance = 0.0;
+
+        for (int leg = 1; leg <= 6; ++leg) {
+            float progress = float(leg) / 6.0;
+            vec3 point = segmentStart + segmentVector * progress;
+            if (leg < 6) {
+                float envelope = sin(3.14159265 * progress);
+                float noiseKey = seed * 17.17
+                    + float(leg) * 23.71
+                    + animationFrame * 11.13;
+                float horizontal = wfSignedHash(noiseKey);
+                float vertical = wfSignedHash(noiseKey + 47.93);
+                point += (
+                    right * horizontal
+                    + up * vertical * 0.65
+                ) * displacement * envelope;
+            }
+
+            float legRayDistance = 0.0;
+            float legDistance = wfRaySegmentDistance(
+                rayDirection,
+                previousPoint,
+                point,
+                legRayDistance
+            );
+            if (legDistance < bestDistance) {
+                bestDistance = legDistance;
+                bestRayDistance = legRayDistance;
+            }
+            previousPoint = point;
+        }
+
+        rayDistance = bestRayDistance;
+        return bestDistance;
+    }
+
+    void main() {
+        vec4 sceneColor = omw_GetLastShader(omw_TexCoord);
+        vec3 sceneRelative = omw_GetWorldPosFromUV(omw_TexCoord) - omw.eyePos.xyz;
+        float sceneDistance = length(sceneRelative);
+        if (sceneDistance <= 0.0001 || bfxSegmentCount <= 0) {
+            omw_FragColor = sceneColor;
+            return;
+        }
+
+        vec3 rayDirection = sceneRelative / sceneDistance;
+        vec3 additiveBeamLight = vec3(0.0);
+        vec3 joinSafeBeamLight = vec3(0.0);
+        float nearestBaseDepth = 1.0e20;
+        vec3 nearestBaseColor = vec3(0.0);
+        float nearestBaseAlpha = 0.0;
+
+        for (int index = 0; index < 64; ++index) {
+            if (index >= bfxSegmentCount) {
+                break;
+            }
+
+            vec4 startWidth = bfxSegmentStartRadius[index];
+            vec4 endMetadata = bfxSegmentEndMetadata[index];
+            // Positive values retain Shader ABI 1 exactly. Negative values
+            // encode extended style IDs 4..7 as -(legacyPayload + 1).
+            bool extendedStyle = endMetadata.w < 0.0;
+            float packedMetadata = extendedStyle
+                ? -endMetadata.w - 1.0
+                : endMetadata.w;
+            // Magnitude bits: palette 4, style 2, opacity 8, intensity 6,
+            // seed 4. The sign extends the style field by one bit.
+            // The renderer uploads an exact integer-valued float. Adding 0.5
+            // here would round odd payloads above 2^23 to the next even float
+            // and could corrupt their low palette/style bits.
+            uint metadata = uint(max(0.0, packedMetadata));
+            int paletteIndex = int(metadata & 15u);
+            int styleId = int((metadata >> 4u) & 3u)
+                + (extendedStyle ? 4 : 0);
+            float opacity = float((metadata >> 6u) & 255u) / 255.0;
+            float intensity = float((metadata >> 14u) & 63u) * (8.0 / 63.0);
+            float seed = float((metadata >> 20u) & 15u);
+            vec4 outerCore = bfxPaletteOuterCore[paletteIndex];
+            vec4 coreGeometry = bfxPaletteCoreGeometry[paletteIndex];
+            vec4 baseShape = bfxPaletteBaseShape[paletteIndex];
+            vec4 longitudinal = bfxPaletteLongitudinal[paletteIndex];
+            bool joinSafe = styleId == 3 || styleId == 4;
+
+            uint featureState = uint(max(0.0, wfSegmentFeatureState(index)));
+            float lifecycle = float(featureState & 255u) / 255.0;
+            uint phaseCode = (featureState >> 8u) & 65535u;
+            uint baseColorPacked = uint(max(0.0, baseShape.x));
+            vec3 baseColor = vec3(
+                float(baseColorPacked & 255u),
+                float((baseColorPacked >> 8u) & 255u),
+                float((baseColorPacked >> 16u) & 255u)
+            ) / 255.0;
+            uint materialPacked = uint(max(0.0, baseShape.y));
+            float baseOpacity = float(materialPacked & 255u) / 255.0;
+            float fogInfluence =
+                float((materialPacked >> 8u) & 255u) / 255.0;
+            float minPixelWidth = max(0.0, baseShape.z);
+            float depthSoftness = max(0.0, baseShape.w);
+            uint shape = uint(max(0.0, longitudinal.x));
+            float startFadeLength = wfDecodeFeatureDistance(shape & 1023u);
+            float endFadeLength = wfDecodeFeatureDistance(
+                (shape >> 10u) & 1023u
+            );
+            int longitudinalMode = int((shape >> 20u) & 3u);
+            bool tapered = ((shape >> 22u) & 1u) != 0u;
+            bool reverseTravel = ((shape >> 23u) & 1u) != 0u;
+            float startRadius = max(0.0, startWidth.w);
+            float endRadius = tapered
+                ? max(0.0, longitudinal.y)
+                : startRadius;
+            float maximumRadius = max(startRadius, endRadius);
+
+            float rayDistance = 0.0;
+            float segmentT = 0.0;
+            float segmentLength = 0.0;
+            float plasmaKey = seed;
+            float plasmaBrightness = 1.0;
+            bool plasmaEmitterCore = false;
+            float distanceToBeam = wfRaySegmentDistance(
+                rayDirection,
+                startWidth.xyz,
+                endMetadata.xyz,
+                rayDistance,
+                segmentT,
+                segmentLength
+            );
+            float along = segmentT * segmentLength;
+            float spatialMask = wfSpatialMask(
+                along,
+                segmentLength,
+                startFadeLength,
+                endFadeLength
+            );
+            float emissiveMask = 1.0;
+            float materialMask = 1.0;
+            wfLongitudinalMasks(
+                longitudinalMode,
+                reverseTravel,
+                phaseCode,
+                longitudinal,
+                along,
+                segmentLength,
+                emissiveMask,
+                materialMask
+            );
+            if (
+                opacity * spatialMask * emissiveMask <= 0.0
+                && baseOpacity * lifecycle * spatialMask * materialMask <= 0.0
+            ) {
+                continue;
+            }
+
+            float pixelWorldSize = 0.0;
+            float pixelFloorRadius = 0.0;
+            if (minPixelWidth > 0.0 || baseOpacity > 0.0) {
+                pixelWorldSize = wfWorldUnitsPerPixel(
+                    rayDirection,
+                    rayDistance
+                );
+                pixelFloorRadius = 0.5
+                    * minPixelWidth
+                    * pixelWorldSize;
+            }
+            float maximumRenderRadius = max(maximumRadius, pixelFloorRadius);
+            float radius = max(
+                0.0,
+                mix(startRadius, endRadius, segmentT)
+            );
+
+            if (styleId == 1) {
+                float displacement = max(0.0, coreGeometry.w);
+                // Most pixels stop at the straight broad path; only nearby
+                // fragments pay for the procedural six-leg lightning shape.
+                if (
+                    distanceToBeam
+                        >= maximumRenderRadius + displacement * 1.25
+                ) {
+                    continue;
+                }
+                distanceToBeam = wfElectricDistance(
+                    rayDirection,
+                    startWidth.xyz,
+                    endMetadata.xyz,
+                    displacement,
+                    seed,
+                    rayDistance
+                );
+            } else if (styleId == 2) {
+                if (
+                    distanceToBeam
+                        >= max(0.001, maximumRenderRadius) * 1.45
+                ) {
+                    continue;
+                }
+                float particleRadius = max(0.001, maximumRadius);
+                distanceToBeam = wfPlasmaParticleDistance(
+                    rayDirection,
+                    startWidth.xyz,
+                    endMetadata.xyz,
+                    max(0.001, maximumRadius),
+                    coreGeometry.w,
+                    seed,
+                    rayDistance,
+                    particleRadius,
+                    plasmaKey,
+                    plasmaBrightness
+                );
+                radius = particleRadius;
+                // Seed zero is reserved for one stable glow at the shared
+                // carrier origin; cross arms must not stack duplicate cores.
+                if (seed < 0.5) {
+                    float emitterRadius = max(12.0, min(startWidth.w * 0.90, 20.0));
+                    float emitterRayDistance = max(0.0, dot(startWidth.xyz, rayDirection));
+                    float emitterDistance = length(
+                        rayDirection * emitterRayDistance - startWidth.xyz
+                    );
+                    if (
+                        emitterDistance / emitterRadius
+                            < distanceToBeam / max(0.001, radius)
+                    ) {
+                        distanceToBeam = emitterDistance;
+                        rayDistance = emitterRayDistance;
+                        radius = emitterRadius;
+                        plasmaBrightness = 1.0;
+                        plasmaEmitterCore = true;
+                    }
+                }
+            }
+
+            if (rayDistance <= omw.near * 0.25) {
+                continue;
+            }
+            float bodyRadius = max(radius, pixelFloorRadius);
+            if (styleId == 4) {
+                // Keep derivative work local while allowing a requested
+                // screen-space floor to remain stable at long view distances.
+                float derivativeCorridor = max(1.0, pixelWorldSize * 1.5);
+                if (distanceToBeam >= bodyRadius + derivativeCorridor) {
+                    continue;
+                }
+            } else if (distanceToBeam >= max(0.001, bodyRadius)) {
+                continue;
+            }
+
+            float filamentAntialias = 0.0;
+            if (styleId == 4) {
+                if (minPixelWidth > 0.0) {
+                    filamentAntialias = max(
+                        fwidth(distanceToBeam),
+                        pixelWorldSize * 0.5
+                    );
+                } else {
+                    // Preserve the ABI 2 thin-filament edge exactly when no
+                    // screen-space floor was requested.
+                    filamentAntialias = min(
+                        1.0,
+                        max(
+                            fwidth(distanceToBeam),
+                            min(0.35, max(0.04, bodyRadius * 0.25))
+                        )
+                    );
+                }
+            }
+            float renderRadius = radius + filamentAntialias;
+            if (styleId == 4) {
+                renderRadius = max(
+                    renderRadius,
+                    bodyRadius + filamentAntialias
+                );
+            }
+            if (distanceToBeam >= renderRadius) {
+                continue;
+            }
+
+            float shellDepth = rayDistance - sqrt(max(
+                0.0,
+                radius * radius - distanceToBeam * distanceToBeam
+            ));
+            float depthTolerance = plasmaEmitterCore ? 3.0 : 1.0;
+            float depthVisibility = 1.0;
+            if (depthSoftness <= 0.0) {
+                if (shellDepth > sceneDistance + depthTolerance) {
+                    continue;
+                }
+            } else {
+                depthVisibility = 1.0 - smoothstep(
+                    sceneDistance - depthSoftness,
+                    sceneDistance + depthTolerance,
+                    shellDepth
+                );
+                if (depthVisibility <= 0.0) {
+                    continue;
+                }
+            }
+
+            float normalizedDistance =
+                distanceToBeam / max(0.001, bodyRadius);
+            float edgeFade = styleId == 4
+                ? 1.0 - smoothstep(
+                    bodyRadius - filamentAntialias,
+                    bodyRadius + filamentAntialias,
+                    distanceToBeam
+                )
+                : 1.0 - smoothstep(0.72, 1.0, normalizedDistance);
+            float haloFalloff = styleId == 2
+                ? 1.95
+                : (styleId == 3
+                    ? 2.45
+                    : (styleId == 4 ? 4.50 : 3.25));
+            float halo = exp(-haloFalloff * normalizedDistance * normalizedDistance) * edgeFade;
+            float coreRatio = clamp(outerCore.w, 0.02, 1.0);
+            if (styleId == 3) {
+                coreRatio *= 0.72;
+            } else if (styleId == 2) {
+                coreRatio *= 0.55;
+            }
+            float coreRadius = bodyRadius * coreRatio;
+            float antialiasWidth = styleId == 4
+                ? filamentAntialias
+                : max(fwidth(distanceToBeam), 0.35);
+            float core = 1.0 - smoothstep(
+                max(0.0, coreRadius - antialiasWidth),
+                coreRadius + antialiasWidth,
+                distanceToBeam
+            );
+            float widthEnergy = tapered
+                ? (
+                    bodyRadius > 0.0
+                        ? clamp(radius / bodyRadius, 0.0, 1.0)
+                        : 0.0
+                )
+                : 1.0;
+            float fogAmount = 0.0;
+            if (fogInfluence > 0.0) {
+                fogAmount = clamp(
+                    wfFogCoverage(rayDirection, rayDistance)
+                        * fogInfluence,
+                    0.0,
+                    1.0
+                );
+            }
+            if (baseOpacity > 0.0 && lifecycle > 0.0) {
+                float bodyAntialias = max(
+                    fwidth(distanceToBeam),
+                    max(0.0001, pixelWorldSize * 0.5)
+                );
+                float bodyCoverage = 1.0 - smoothstep(
+                    max(0.0, bodyRadius - bodyAntialias),
+                    bodyRadius + bodyAntialias,
+                    distanceToBeam
+                );
+                float baseAlpha = baseOpacity
+                    * lifecycle
+                    * spatialMask
+                    * materialMask
+                    * bodyCoverage
+                    * depthVisibility
+                    * widthEnergy;
+                if (
+                    baseAlpha > 0.0
+                    && shellDepth < nearestBaseDepth
+                ) {
+                    nearestBaseDepth = shellDepth;
+                    nearestBaseColor = mix(
+                        baseColor,
+                        omw.fogColor.rgb,
+                        fogAmount
+                    );
+                    nearestBaseAlpha = clamp(baseAlpha, 0.0, 1.0);
+                }
+            }
+
+            float flicker = 0.94 + 0.06 * sin(
+                omw.simulationTime * 21.0
+                + seed * 1.37
+                + dot(
+                    startWidth.xyz + endMetadata.xyz,
+                    vec3(0.013, 0.017, 0.019)
+                )
+            );
+            if (styleId == 1) {
+                flicker = 0.82 + 0.18 * sin(
+                    omw.simulationTime * 37.0
+                    + seed * 2.11
+                );
+            } else if (styleId == 2) {
+                flicker = plasmaEmitterCore
+                    ? 0.95 + 0.05 * sin(omw.simulationTime * 4.0 + seed * 0.53)
+                    : plasmaBrightness;
+            } else if (joinSafe) {
+                flicker = 1.0;
+            }
+            intensity = max(0.0, intensity) * flicker;
+            opacity = clamp(opacity, 0.0, 1.0)
+                * spatialMask
+                * emissiveMask
+                * depthVisibility
+                * widthEnergy
+                * (1.0 - fogAmount);
+            if (joinSafe) {
+                vec3 segmentLight =
+                    outerCore.rgb * halo * opacity * intensity
+                    + coreGeometry.rgb * core * opacity * intensity;
+                // Connected caps share pixels. Max composition forms their
+                // union without the additive hot spots that make polylines
+                // look like dotted strings.
+                joinSafeBeamLight = max(joinSafeBeamLight, segmentLight);
+            } else if (plasmaEmitterCore) {
+                // The NIF supplies the solid center. This larger shader sphere
+                // contributes only a soft pulse around it, avoiding depth
+                // competition with the carrier as the viewpoint changes.
+                additiveBeamLight +=
+                    outerCore.rgb * halo * opacity * intensity * 0.78;
+            } else {
+                // Preserve Shader ABI 1 arithmetic ordering for every
+                // ordinary additive style.
+                additiveBeamLight +=
+                    outerCore.rgb * halo * opacity * intensity;
+                additiveBeamLight +=
+                    coreGeometry.rgb * core * opacity * intensity;
+            }
+        }
+
+        vec3 composedScene = mix(
+            sceneColor.rgb,
+            nearestBaseColor,
+            nearestBaseAlpha
+        );
+        omw_FragColor = vec4(
+            composedScene + additiveBeamLight + joinSafeBeamLight,
+            sceneColor.a
+        );
+    }
+}
+
+technique {
+    passes = main;
+    glsl_version = 330;
+    dynamic = true;
+    description = "BeamFX compact depth-aware beam renderer";
+    author = "BeamFX";
+    version = "3";
+}

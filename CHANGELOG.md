@@ -31,6 +31,13 @@
 - Added an optional interactive visual gallery that previews styles, presets,
   radius, intensity, fades, taper, longitudinal modes, and filament pixel
   width while showing or printing the corresponding Lua values.
+- The visual gallery now claims interactive UI focus without pausing its
+  preview, supports a draggable on-screen-clamped header, adapts to resolution
+  and GUI-scale changes, and keeps wrapped recipe output inside a bounded
+  read-only field. F7 repositions the preview even while the panel is hidden.
+  F8, Escape, and Hide release the panel and cursor without clearing or
+  resetting the world preview; a separate Clear/Preview control owns that
+  lifecycle.
 
 ### Framework behavior
 
