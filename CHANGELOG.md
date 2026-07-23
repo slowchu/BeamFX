@@ -49,6 +49,11 @@
 - The producer facade now exposes eleven bound methods: the original nine plus
   `emit` and `upsertPath`.
 
+### Licensing
+
+- Corrected the BeamFX license declaration from MIT to GPL-3.0-or-later to
+  match OpenMW's licensing requirements.
+
 ### Version tracks
 
 | Track | Version |
@@ -143,8 +148,7 @@
 
 ## 0.1.0-alpha.1 — initial alpha release
 
-This version is prepared, locally verified, and released under the MIT
-License.
+This version was prepared and locally verified as the initial alpha release.
 
 ### For mod authors
 
@@ -196,8 +200,3 @@ License.
   authoritative persistent visuals after load, new game, or provider reset.
 - Postprocessing availability is controlled by the local OpenMW
   installation and configuration.
-
-### License
-
-- Released under the MIT License.
-- Copyright (c) 2026 slowchu.

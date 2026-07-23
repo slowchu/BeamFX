@@ -5,6 +5,9 @@ LuaLS-stub, or annotation dependency and requires no BeamFX private module.
 BeamFX is optional: if it is missing, resetting, or incompatible, your
 gameplay continues and only the beam visual is skipped.
 
+The adapter template is distributed under GPL-3.0-or-later. Include BeamFX's
+`LICENSE` file with any redistributed copy of the template.
+
 ## Copy and rename
 
 Copy `scripts/example_beam_consumer` into your data root, then change:

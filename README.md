@@ -13,7 +13,7 @@ saved gameplay. If BeamFX is missing or temporarily unavailable, a well-made
 producer should lose only its beam visuals.
 
 > **Alpha status:** this is package `0.1.0-alpha.4`, public API `1.3`.
-> BeamFX is open-source software released under the MIT License.
+> BeamFX is free software licensed under GPL-3.0-or-later.
 
 ## Start here
 
@@ -36,7 +36,8 @@ Start with [the friendly usage guide](docs/USAGE.md). It includes:
 - space changes, cleanup, errors, and troubleshooting.
 
 Use [the API reference](docs/API.md) when you need every field, return value,
-quota, and stable error code.
+quota, and stable error code. Use [the architecture guide](docs/ARCHITECTURE.md)
+when you need to understand ownership, routing, or the renderer pipeline.
 
 ## Requirements
 
@@ -264,6 +265,7 @@ BeamFX.
 
 - [Usage guide](docs/USAGE.md) — learn by building effects.
 - [API reference](docs/API.md) — exact contracts and schemas.
+- [Architecture](docs/ARCHITECTURE.md) — ownership and data flow.
 - [Consumer adapter](examples/consumer_adapter) — copyable integration
   plumbing for an ordinary mod.
 - [Interactive gallery](examples/visual_gallery) — tune an effect in game and
@@ -272,6 +274,7 @@ BeamFX.
 
 ## License
 
-BeamFX is released under the [MIT License](LICENSE).
+BeamFX is licensed under the [GNU General Public License](LICENSE), version 3
+or (at your option) any later version (`GPL-3.0-or-later`).
 
-Copyright (c) 2026 slowchu.
+Copyright (C) 2026 slowchu.
